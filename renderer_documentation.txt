@@ -1,0 +1,1530 @@
+================================================================================
+S4 LEAGUE RENDERER - FULL REVERSE
+================================================================================
+ImageBase: 0x00E80000   .text: 0x00E81000-0x026C7000
+Every address is a VA against that base.
+
+The engine's real namespace: CoreLib::Renderer  (names taken from the exe's RTTI)
+
+Classes found (RTTI):
+  .?AVIRenderer@Renderer@CoreLib@@                    renderer root interface
+  .?AVCRenderer_D3D@Renderer@CoreLib@@                D3D9 implementation
+  .?AVIRendererObject@Renderer@CoreLib@@              base of every resource
+  .?AVIRenderTarget@Renderer@CoreLib@@                render target interface
+  .?AVCRenderTarget_D3D@Renderer@CoreLib@@            impl
+  .?AVIRenderTargetManager@Renderer@CoreLib@@         render target stack
+  .?AVCRenderTargetManager_D3D@Renderer@CoreLib@@     impl
+  .?AVCTexture_D3D@Renderer@CoreLib@@                 texture
+  .?AV?$CComponentCreator@VCTexture_D3D@...           texture factory
+  .?AV?$CSingleton@VIRenderer@Renderer@CoreLib@@      IRenderer is a SINGLETON
+
+================================================================================
+1. SINGLETONS AND BASE ACCESSORS
+================================================================================
+0x01CE63B0   IRenderer* GetRenderer()          { return g_pRenderer; }   // data at 0x025BD0B8
+0x01CA7740   IDirect3DDevice9* CRenderer_D3D::GetDevice(this)  { return *(this+0x69C); }
+0x01DB0C20   ICapability* CRenderer_D3D::GetCapability(this)   { return *(this+0x44); }
+0x017A1020   IComponentCreator<CTexture_D3D>* GetTextureFactory(renderer)
+0x01CC1E60   T* Unwrap(smartptr)               { return *smartptr; }  // handle deref
+0x0153C030   assign(smartptr&, T*)             // handle/refcount assignment
+0x01C853A0   D3DFORMAT MapFormat(int idx)      { return g_fmtTable[idx]; } // table 0x0256F6DC
+
+CRenderer_D3D FIELDS (offsets from this):
+  +0x08    presentation HWND (passed to Present)
+  +0x44    ICapability_D3D*
+  +0x74    smart-ptr to the SCREEN TEXTURE (the scene texture)  <-- KEY
+  +0x87    bool m_bInScene       (1 between BeginScene and EndScene)
+  +0x88    bool m_bCanPresent    (if 0, UpdateScreen does not call Present)
+  +0x69C   IDirect3DDevice9*
+
+FORMAT TABLE (0x0256F6DC, internal enum index -> D3DFORMAT):
+   0 -> 0    D3DFMT_UNKNOWN
+   1 -> 20   D3DFMT_R8G8B8
+   2 -> 21   D3DFMT_A8R8G8B8
+   3 -> 22   D3DFMT_X8R8G8B8
+   4 -> 23   D3DFMT_R5G6B5
+   5 -> 26   D3DFMT_A1R5G5B5
+   6 -> 28   D3DFMT_A4R4G4B4
+   7 -> 114  D3DFMT_R32F
+   8 -> 111  D3DFMT_R16F
+   9 -> 'DXT1'
+  10 -> 'DXT3'
+  11 -> 0
+  12 -> 77   D3DFMT_D24X8
+  13 -> 75   D3DFMT_D24S8
+  14 -> 73   D3DFMT_D15S1
+  15 -> 80   D3DFMT_D16
+================================================================================
+2. CRenderer_D3D VTABLE   (base 0x023DF9A0, RTTI at 0x023DF99C)
+================================================================================
+idx  off    function                       deduced name
+  0  0x00   0x01C852C0
+  1  0x04   0x01C80BC0                     IRenderer::CreateScreenTexture
+  2  0x08   0x01C80CD0
+  3  0x0C   0x01C81460
+  4  0x10   0x01C814A0
+  5  0x14   0x01C82620                     Init  (Direct3DCreate9 / CreateDevice)
+  6  0x18   0x01C83020
+  7  0x1C   0x01C83520
+  8  0x20   0x01C83620
+  9  0x24   0x01C82270
+ 10  0x28   0x01C82350
+ 11  0x2C   0x01C82340
+ 12  0x30   0x01C82360
+ 13  0x34   0x01C82370
+ 14  0x38   0x01C822A0
+ 15  0x3C   0x01C836E0
+ 16  0x40   0x01C83790                     OnLostDevice / Reset
+ 17  0x44   0x01C83960
+ 18  0x48   0x01DC4050
+ 19  0x4C   0x01C81530
+ 20  0x50   0x01C815B0
+ 21  0x54   0x01C81690
+ 22  0x58   0x01C819B0
+ 23  0x5C   0x011D67F0
+ 24  0x60   0x00F93A50
+ 25  0x64   0x01C819D0
+ 26  0x68   0x01C83B20                     ClearBuffer
+ 27  0x6C   0x01C822E0                     IsInScene()   -> returns *(this+0x87)
+ 28  0x70   0x01C83C50                     BeginScene
+ 29  0x74   0x01C83CC0                     EndScene
+ 30  0x78   0x01C83D30                     UpdateScreen  (Present)
+ 31  0x7C   0x01C83E00
+ 32  0x80   0x01C83E40                     SaveScreen (GetBackBuffer + D3DXSaveSurfaceToFile)
+ 33  0x84   0x01C83F00
+ 34  0x88   0x01C84680                     UpdateScreenTexture      <-- CLAVE
+ 35  0x8C   0x01C822C0
+ 36  0x90   0x01C81A20
+ 37  0x94   0x01C81CC0
+ 38  0x98   0x01C83FC0
+ 39  0x9C   0x01C83FF0
+ 40  0xA0   0x01C82320
+ 41  0xA4   0x01C82300
+ 42  0xA8   0x01C84020
+ 43  0xAC   0x01C840B0
+ 44  0xB0   0x01C84110
+ 45  0xB4   0x01C849B0
+ 46  0xB8   0x01C84A60
+ 47  0xBC   0x01C84190
+ 48  0xC0   0x01C84280
+ 49  0xC4   0x01C84420
+ 50  0xC8   0x01C81F60
+ 51  0xCC   0x01C84900
+ 52  0xD0   0x01C84790
+ 53  0xD4   0x01C81FA0
+ 54  0xD8   0x01C81FD0
+ 55  0xDC   0x01C84E50
+ 56  0xE0   0x01C85190
+ 57  0xE4   0x01C85320                     UsesIndexBufferPool()  (bool)
+ 58  0xE8   0x01C85340                     UsesVertexBufferPool() (bool)
+ 59  0xEC   0x01C84170
+
+================================================================================
+
+================================================================================
+3. FRAME CYCLE
+================================================================================
+
+--- CRenderer_D3D::BeginScene   0x01C83C50 ---------------------------------
+  if (m_bInScene) return true;                      // idempotent
+  hr = device->BeginScene();                        // D3D9 vtbl +0xA4 (idx 41)
+  if (FAILED) { Log("[ERROR] CRenderer_D3D::BeginScene [BeginScene %x]"); return 0; }
+  m_bInScene = 1;
+  return 1;
+
+--- CRenderer_D3D::EndScene     0x01C83CC0 ---------------------------------
+  if (!m_bInScene) return true;                     // idempotent
+  hr = device->EndScene();                          // D3D9 vtbl +0xA8 (idx 42)
+  if (FAILED) { Log("[ERROR] CRenderer_D3D::EndScene [EndScene %x]"); return 0; }
+  m_bInScene = 0;
+  return 1;
+
+  IMPORTANT: BeginScene/EndScene are FLAG COUNTED, not nested. The engine opens and
+  closes them many times per frame (every render target change closes and reopens
+  them). Our backend must do nothing expensive there.
+
+--- CRenderer_D3D::ClearBuffer  0x01C83B20 ---------------------------------
+  ClearBuffer(BYTE flags, BYTE r, BYTE g, BYTE b)
+  if (m_bInScene) this->EndScene();                 // closes the scene before Clear
+  d3dflags = (flags&1 ? D3DCLEAR_TARGET : 0)
+           | (flags&2 ? D3DCLEAR_ZBUFFER : 0)
+           | (flags&4 ? D3DCLEAR_STENCIL : 0);
+  color = 0xFF000000 | (r<<16) | (g<<8) | b;
+  hr = device->Clear(0, NULL, d3dflags, color, <z>, <stencil>);   // D3D9 vtbl +0xAC (idx 43)
+  if (FAILED) Log("[ERROR] CRenderer_D3D::ClearBuffer [Clear %x]");
+
+  NOTE: the game's bitmask is NOT the D3D9 one. 1=TARGET, 2=ZBUFFER, 4=STENCIL map
+  one to one by coincidence (D3DCLEAR_TARGET=1, ZBUFFER=2, STENCIL=4), but the code
+  makes it explicit. And Clear always goes with pRects=NULL: it clears the WHOLE
+  render target, not the viewport.
+
+--- CRenderer_D3D::UpdateScreen 0x01C83D30 ---------------------------------
+  UpdateScreen(x, y, w, h)      // all four zero = full screen
+  RECT* pr = NULL;
+  if (x|y|w|h) { g_rect = {x,y,w,h}; pr = &g_rect; }   // globals 0x026B57C8..0x026B57D4
+  if (!this->m_bCanPresent /* *(this+0x88) */) return;
+  hr = device->Present(pr, pr, this->m_hWnd /* *(this+8) */, NULL);  // D3D9 vtbl +0x44 (idx 17)
+  if (FAILED) Log("[ERROR] CRenderer_D3D::UpdateScreen [Present %x]");
+
+  Note: it passes an EXPLICIT hWnd (overriding hDeviceWindow) plus source/dest
+  rectangles. Our Present ignores the rects (always full screen); that is correct as
+  long as the game passes 0,0,0,0, which is the normal case.
+
+--- CRenderer_D3D::SaveScreen   0x01C83E40 ---------------------------------
+  device->GetBackBuffer(...) + D3DXSaveSurfaceToFile. Screenshots only.
+
+================================================================================
+4. THE SCREEN TEXTURE (scene texture)
+================================================================================
+
+--- IRenderer::CreateScreenTexture   0x01C80BC0 ----------------------------
+  int fmt = 3;                                       // X8R8G8B8 by default
+  ICapability* cap = GetCapability(GetRenderer());
+  if      (cap->IsSupportedFormat(3)) fmt = 3;       // X8R8G8B8
+  else if (cap->IsSupportedFormat(2)) fmt = 2;       // A8R8G8B8
+  else if (cap->IsSupportedFormat(4)) fmt = 4;       // R5G6B5
+  else if (cap->IsSupportedFormat(5)) fmt = 5;       // A1R5G5B5
+                                                     // cap vtbl +0x3C (idx 15)
+  MemTag("CoreLib::Renderer::IRenderer::CreateScreenTexture");
+  this->m_pScreenTexture /* this+0x74 */ =
+        textureFactory->CreateTexture_ColorTarget(
+              /*bAutoMip*/ 0,
+              /*fmt     */ fmt,
+              /*width   */ 512,
+              /*height  */ 512 );
+
+  ==> THE SCENE TEXTURE IS A FIXED 512x512. It is NOT the size of the backbuffer.
+      No mipmaps. Render target. D3DPOOL_DEFAULT.
+
+--- CRenderer_D3D::UpdateScreenTexture   0x01C84680  (vtbl idx 34) ---------
+  IDirect3DSurface9 *bb = NULL, *dst = NULL;
+  hr = device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb);   // D3D9 idx 18
+  if (FAILED) { Log("[ERROR] ... UpdateScreenTexture [GetBackBuffer %x]"); return; }
+
+  CTexture_D3D* t = Unwrap(this->m_pScreenTexture);                 // this+0x74
+  hr = t->GetSurface(0, &dst);                                      // CTexture vtbl +0x7C
+  if (FAILED) { Log("[ERROR] ... UpdateScreenTexture [GetSurface]"); ... }
+
+  hr = device->StretchRect(bb, NULL, dst, NULL, D3DTEXF_NONE);      // D3D9 idx 34
+  if (FAILED) Log("[ERROR] ... UpdateScreenTexture [StretchRect %x]");
+
+  bb->Release(); dst->Release();
+
+  ==> It is a DOWNSCALE from the backbuffer (e.g. 1920x1080) to 512x512.
+      StretchRect SCALES in D3D9. A D3D11 CopyResource does NOT. That is why the
+      fullscreen-triangle blit is mandatory when the sizes differ. It is already
+      implemented that way in backend_d3d11.cpp::StretchRect.
+
+  ==> For the copy to work the destination texture MUST have an RTV (at the very
+      least, our StretchRect needs one to blit into). Since the game creates it with
+      D3DUSAGE_RENDERTARGET, honouring that flag and giving it BIND_RENDER_TARGET is
+      enough. Otherwise the copy is silently lost and the scene texture keeps the OLD
+      frame -> the reflective floor shows whatever was on screen before.
+
+--- Who consumes the screen texture -----------------------------------------
+  The .fx files sample it as SceneMapSampler with tex2Dproj(...). The water,
+  reflection, refraction and haze shaders are its main clients. That is why the
+  failure looks like "the floor reflects something else".
+
+================================================================================
+5. CRenderTargetManager_D3D   (vtable base 0x024076F8, RTTI 0x024076F4)
+================================================================================
+idx  off    function
+  0  0x00   0x01D907A0    dtor
+  1  0x04   0x014DA180
+  2  0x08   0x014DA180
+  3  0x0C   0x01D901A0    CreateRenderTarget(fmt, bAutoMip, w, h)
+  4  0x10   0x01D90240    CreateDepthStencilSurface(a, w, h)
+  5  0x14   0x01D902E0    PushRenderTarget(IRenderTarget*)
+  6  0x18   0x01D903F0    PopRenderTarget()
+  7  0x1C   0x01D904C0    PushDepthStencilSurface(...)
+  8  0x20   0x01D90580    PopDepthStencilSurface()
+
+FIELDS: this+0x04 = the STACK (container) of saved IDirect3DSurface9*.
+Helpers: 0x01D90C20 push, 0x01D90B90 pop, 0x01CAE900 back(), 0x01CFBB90 empty().
+
+--- CreateRenderTarget   0x01D901A0 ----------------------------------------
+  void* p = operator new(0x24);
+  CRenderTarget_D3D* rt = p ? CRenderTarget_D3D::CRenderTarget_D3D(p) : NULL;   // ctor 0x01DE6570
+  rt->Create(fmt, bAutoMip, w, h);        // vtbl +0x10 -> 0x01DF18D0
+  return rt;
+
+--- CreateDepthStencilSurface  0x01D90240 ----------------------------------
+  void* p = operator new(0x1C);
+  CDepthStencilSurface_D3D* ds = p ? ctor_0x01DE6710(p) : NULL;
+  ds->Create(a, w, h);                    // vtbl +0x10 -> 0x01DE67C0
+  return ds;
+
+--- PushRenderTarget   0x01D902E0   <<< KEY FUNCTION >>> --------------------
+  bool wasInScene = GetRenderer()->IsInScene();          // vtbl idx 27
+  if (wasInScene) GetRenderer()->EndScene();             // vtbl idx 29
+
+  IDirect3DSurface9* cur = NULL;
+  IDirect3DDevice9* dev = GetRenderer()->GetDevice();
+  hr = dev->GetRenderTarget(0, &cur);                    // D3D9 idx 38 (+0x98)
+  if (FAILED) Log("[ERROR] CRenderTargetManager_D3D::PushRenderTarget [GetRenderTarget %x]");
+
+  this->m_stack.push_back(cur);                          // 0x01D90C20
+
+  IDirect3DSurface9* s = rt->GetSurface();               // 0x01DFA110 -> rt[0x20]
+  hr = dev->SetRenderTarget(0, s);                       // D3D9 idx 37 (+0x94)
+  if (FAILED) Log("[ERROR] CRenderTargetManager_D3D::PushRenderTarget [SetRenderTarget %x]");
+
+  if (wasInScene) GetRenderer()->BeginScene();           // vtbl idx 28
+
+--- PopRenderTarget   0x01D903F0 -------------------------------------------
+  if (this->m_stack.empty()) return;                     // 0x01CFBB90
+  bool wasInScene = GetRenderer()->IsInScene();
+  if (wasInScene) GetRenderer()->EndScene();
+  IDirect3DSurface9* s = this->m_stack.back();           // 0x01CAE900
+  this->m_stack.pop_back();                              // 0x01D90B90
+  dev->SetRenderTarget(0, s);
+  ... (same logging pattern, and BeginScene if it was needed)
+
+--- PushDepthStencilSurface   0x01D904C0 -----------------------------------
+  hr = dev->GetDepthStencilSurface(&cur);                // D3D9 idx 40 (+0xA0)
+  if (FAILED) Log("[ERROR] ... PushDepthStencilSurface [GetDepthStencilSurface %x]");
+  stack.push(cur);
+  hr = dev->SetDepthStencilSurface(ds->GetSurface());    // D3D9 idx 39 (+0x9C)
+  if (FAILED) Log("[ERROR] ... PushDepthStencilSurface [SetDepthStencilSurface %x]");
+
+--- PopDepthStencilSurface   0x01D90580 -----------------------------------
+  symmetric to the render target Pop.
+
+>>> DIRECT CONSEQUENCE FOR NativeEngine <<<
+The engine saves and restores render targets with a STACK, and what it pushes is
+EXACTLY what GetRenderTarget(0) returns. If our GetRenderTarget always returns the
+backbuffer (instead of the CURRENT target), then:
+   Push(A)  -> pushes the backbuffer, sets A        [ok by accident]
+   Push(B)  -> pushes the backbuffer AGAIN, sets B  [WRONG: it should push A]
+   Pop()    -> restores the backbuffer              [WRONG: it should restore A]
+so everything the game draws after the inner Pop goes to the SCREEN instead of to
+target A, and A is left half filled / with stale content.
+Expected symptoms: reflections with the wrong content, effects that look like a flat
+square, stripes that appear and disappear depending on the camera.
+=> GetRenderTarget(0) MUST return the surface of the current target.
+The same applies to GetDepthStencilSurface.
+
+================================================================================
+6. IRenderTarget / CRenderTarget_D3D
+================================================================================
+FIELDS (0x24 byte object):
+  +0x0C   smart-ptr to the CTexture_D3D
+  +0x10   fmt (internal enum index)
+  +0x14   bool bAutoMip
+  +0x18   width
+  +0x1C   height
+  +0x20   IDirect3DSurface9* (the texture's level 0 surface)
+
+--- CRenderTarget_D3D::Create  0x01DF18D0 ----------------------------------
+  Create(fmt, bAutoMip, w, h)
+  this->m_fmt = fmt; this->m_bAutoMip = bAutoMip;
+  this->m_w = w; this->m_h = h;
+  MemTag("CoreLib::Renderer::IRenderTarget::Create");
+  factory = GetTextureFactory(GetRenderer());            // 0x017A1020
+  this->m_pTexture /* +0x0C */ =
+        factory->CreateTexture_ColorTarget(bAutoMip, fmt, w, h);   // factory vtbl +0x1C
+
+--- IRenderTarget::GetSurface  0x01DFA110 ----------------------------------
+  return this[0x20];
+
+================================================================================
+7. CTexture_D3D
+================================================================================
+FIELDS:
+  +0x10   type: 0 = normal texture, 1 = color target
+  +0x44   bool bAutoMip
+  +0x48   fmt (internal enum index)
+  +0x4C   0
+  +0x50   1
+  +0x54   width
+  +0x58   height
+  +0x5C   0
+
+--- CTexture_D3D::CreateTexture  0x01DE50E0  (normal texture) --------------
+  m_type = 0; m_bAutoMip = arg0; m_fmt = arg1; m_w = arg2; m_h = arg3;
+  cap = GetCapability(GetRenderer());
+  cap->GetMaxTextureSize(&maxW, &maxH);                 // cap vtbl +0x4C (idx 19)
+  if (maxW < w) w = maxW;                               // CLAMPS down
+  if (maxH < h) h = maxH;
+  usage  = bAutoMip ? 0x400 /*D3DUSAGE_AUTOGENMIPMAP*/ : 0;
+  levels = bAutoMip ? 0xFFFFFFFF : 1;
+  D3DXCreateTexture(device, w, h, levels, usage, MapFormat(m_fmt),
+                    D3DPOOL_MANAGED /*1*/, &m_pTex);
+
+--- CTexture_D3D::CreateTexture_ColorTarget  0x01DE5240 -------------------
+  m_type = 1; m_bAutoMip = arg0; m_fmt = arg1; m_w = arg2; m_h = arg3;
+  cap->GetMaxTextureSize(&maxW, &maxH);  + same clamp
+  usage  = bAutoMip ? 0x401 /*RENDERTARGET|AUTOGENMIPMAP*/ : 0x1 /*RENDERTARGET*/;
+  levels = bAutoMip ? 0xFFFFFFFF : 1;
+  D3DXCreateTexture(device, w, h, levels, usage, MapFormat(m_fmt),
+                    D3DPOOL_DEFAULT /*0*/, &m_pTex);
+  if (FAILED) Log("[ERROR] CTexture_D3D::CreateTexture_ColorTarget [D3DXCreateTexture %x]");
+
+  ==> NOTE: it goes through D3DXCreateTexture (d3dx9), NOT through
+      device->CreateTexture directly. D3DX queries caps internally and ends up
+      calling OUR IDirect3DDevice9::CreateTexture with the Usage intact. So the
+      D3DUSAGE_RENDERTARGET flag DOES reach us and has to be honoured.
+
+--- CTexture_D3D::CreateTexture_FromMemory     0x01DE53A0 -----------------
+  D3DXGetImageInfoFromFileInMemory + D3DXCreateTextureFromFileInMemoryEx.
+  This is the path for textures on disk (DDS/TGA/etc inside the .s4 archives).
+
+--- CTexture_D3D::CreateCubeTexture_FromMemory 0x01DE5660 -----------------
+  D3DXGetImageInfoFromFileInMemory + D3DXCreateCubeTextureFromFileInMemoryEx
+  + GetSurfaceLevel/LockRect/UnlockRect + optional D3DXSaveTextureToFile.
+  ==> The game DOES create cube textures. Today backend_d3d11.cpp::CreateCubeTexture
+      returns NULL. If a map uses a reflection cubemap, that is where it fails.
+
+--- CTexture_D3D::GetSurface  (vtbl +0x7C, idx 31) ------------------------
+  Returns the IDirect3DSurface9 of the requested level (a GetSurfaceLevel wrapper).
+
+================================================================================
+8. CDepthStencilSurface_D3D
+================================================================================
+--- Create  0x01DE67C0 -----------------------------------------------------
+  Create(a, w, h)
+  this[0x0C]=a; this[0x10]=w; this[0x14]=h;
+  caps = GetCapsBlock(GetRenderer());            // 0x01DE68D0
+  dev  = GetDevice(GetRenderer());
+  hr = dev->CreateDepthStencilSurface(
+          w, h,
+          caps[0x28],        // D3DFORMAT of the depth chosen at startup
+          caps[0x10],        // D3DMULTISAMPLE_TYPE
+          0,                 // MultisampleQuality
+          TRUE,              // Discard
+          &this[0x18],       // ppSurface
+          NULL);             // D3D9 vtbl +0x74 (idx 29)
+  if (FAILED) Log("[ERROR] CDepthStencilSurface_D3D::Create [CreateDepthStencilSurface %x]");
+
+================================================================================
+9. VERTEX / INDEX BUFFERS
+================================================================================
+--- CVertexBuffer_D3D::CreateVB  0x01D8C260 -------------------------------
+  stores decl (+0x0C), count (+0x10), size (+0x14), dynamic (+0x18)
+  if (GetRenderer()->UsesVertexBufferPool() /* vtbl +0xE8 */)
+        -> takes a block from CVertexBufferPool_D3D  (0x01DE3050 Init, 0x01D8B760)
+  else  -> device->CreateVertexBuffer(...)
+  Errors: "[ERROR] CVertexBuffer_D3D::CreateVB [CreateVertexBuffer %x]"
+          "[ERROR] CVertexBuffer_D3D::LockVB   [Lock %x]"    0x01D8C460
+          "[ERROR] CVertexBuffer_D3D::UnlockVB [Unlock %x]"
+
+--- CIndexBuffer_D3D::CreateIB   0x01D8BBA0 -------------------------------
+  if (GetRenderer()->UsesIndexBufferPool() /* vtbl +0xE4 */)
+        -> CIndexBufferPool_D3D  (0x01DE29C0 Init, 0x01D8B630)
+  else  -> device->CreateIndexBuffer(...)
+
+  ==> There are VB/IB POOLS: one large buffer subdivided. The Locks carry an offset
+      into the pool. If our Lock ignores the offset/flags (D3DLOCK_NOOVERWRITE /
+      D3DLOCK_DISCARD) data gets overwritten between draws.
+
+================================================================================
+10. CCapability_D3D
+================================================================================
+0x01D89780  OnResetDevice                 (GetDeviceCaps + GetBackBuffer)
+0x01D89850  CollectDeviceCapability       (GetAdapterIdentifier, GetDeviceCaps,
+                                           GetAdapterDisplayMode, EnumAdapterModes)
+Virtual methods the renderer uses:
+  cap vtbl +0x3C (idx 15)  bool IsSupportedFormat(int fmtIdx)
+  cap vtbl +0x4C (idx 19)  void GetMaxTextureSize(UINT* w, UINT* h)
+
+  ==> Our GetDeviceCaps returns MaxTextureWidth/Height = 8192, so the CreateTexture
+      clamp never truncates. Good.
+  ==> IsSupportedFormat comes from CheckDeviceFormat on the IDirect3D9. If we say
+      X8R8G8B8 is unsupported, the screen texture falls back to R5G6B5 and the
+      reflection loses precision. Format 22 (X8R8G8B8) has to be supported.
+
+================================================================================
+11. REAL ORDER OF A FRAME (reconstructed)
+================================================================================
+  ClearBuffer(...)                    -> EndScene if needed + device->Clear
+  BeginScene()
+     ... scene geometry ...
+     for every effect that needs an auxiliary target:
+        rtMgr->PushRenderTarget(rt)   -> EndScene, GetRenderTarget(0), push,
+                                         SetRenderTarget(0, rt), BeginScene
+        ... draws into rt ...
+        rtMgr->PopRenderTarget()      -> EndScene, pop, SetRenderTarget(0, prev),
+                                         BeginScene
+     UpdateScreenTexture()            -> GetBackBuffer + StretchRect to 512x512
+     ... passes that sample SceneMap (water, reflection, refraction, haze) ...
+  EndScene()
+  UpdateScreen(0,0,0,0)               -> device->Present(NULL, NULL, hWnd, NULL)
+================================================================================
+12. FULL LIST OF THE RENDERER ERROR STRINGS AND THEIR FUNCTION
+================================================================================
+VA_string   function      text
+0x023DF430  0x01C80BC0    CoreLib::Renderer::IRenderer::CreateScreenTexture (tag)
+0x0240FD58  0x01DF18D0    CoreLib::Renderer::IRenderTarget::Create (tag)
+0x023DF3FF  -             IRenderer::UninitDeviceMove Failed
+0x023DF56F  -             CRenderer_D3D::GetVideoMemState [GetAvailableVidMem %x]
+0x023DF5B8  -             CRenderer_D3D::BuildGraphicParameters::ChangeDisplaySettings Failed
+0x023DF608  0x01C83790    CRenderer_D3D::OnLostDevice [Reset %x]
+0x023DF63C  0x01C83B20    CRenderer_D3D::ClearBuffer [Clear %x]
+0x023DF670  0x01C83C50    CRenderer_D3D::BeginScene [BeginScene %x]
+0x023DF6A8  0x01C83CC0    CRenderer_D3D::EndScene [EndScene %x]
+0x023DF6DC  0x01C83D30    CRenderer_D3D::UpdateScreen [Present %x]
+0x023DF71C  0x01C83E40    CRenderer_D3D::SaveScreen [GetBackBuffer %x]
+0x023DF758  0x01C83E40    CRenderer_D3D::SaveScreen [D3DXSaveSurfaceToFile %x]
+0x023DF79C  0x01C82620    CRenderer_D3D::Init [Direct3DCreate9]
+0x023DF7D0  0x01C82620    CRenderer_D3D::Init [DirectDrawCreateEx]
+0x023DF88C  0x01C82620    CRenderer_D3D::Init [CreateDevice %x]
+0x023DF8D0  0x01C84680    CRenderer_D3D::UpdateScreenTexture [GetBackBuffer %x]
+0x023DF914  0x01C84680    CRenderer_D3D::UpdateScreenTexture [GetSurface]
+0x023DF958  0x01C84680    CRenderer_D3D::UpdateScreenTexture [StretchRect %x]
+0x02407598  0x01D902E0    CRenderTargetManager_D3D::PushRenderTarget [GetRenderTarget %x]
+0x024075E8  0x01D902E0    CRenderTargetManager_D3D::PushRenderTarget [SetRenderTarget %x]
+0x02407638  0x01D904C0    CRenderTargetManager_D3D::PushDepthStencilSurface [GetDepthStencilSurface %x]
+0x02407698  0x01D904C0    CRenderTargetManager_D3D::PushDepthStencilSurface [SetDepthStencilSurface %x]
+0x0240EE08  0x01DE50E0    CTexture_D3D::CreateTexture [D3DXCreateTexture %x]
+0x0240EE58  0x01DE5240    CTexture_D3D::CreateTexture_ColorTarget [D3DXCreateTexture %x]
+0x0240EEA8  0x01DE53A0    CTexture_D3D::CreateTexture_FromMemory [D3DXGetImageInfoFromFileInMemory %x]
+0x0240EF30  0x01DE53A0    CTexture_D3D::CreateTexture_FromMemory [D3DXCreateTextureFromFileInMemoryEx %x]
+0x0240EF90  0x01DE5660    CTexture_D3D::CreateCubeTexture_FromMemory [D3DXGetImageInfoFromFileInMemory %x]
+0x0240F030  0x01DE5660    CTexture_D3D::CreateCubeTexture_FromMemory [D3DXCreateCubeTextureFromFileInMemoryEx %x]
+0x0240F098  0x01DE5660    CTexture_D3D::CreateCubeTexture_FromMemory [LockRect %x]
+0x0240F0E0  0x01DE5660    CTexture_D3D::CreateCubeTexture_FromMemory [UnlockRect %x]
+0x0240F130  0x01DE5660    CTexture_D3D::CreateCubeTexture_FromMemory [GetSurfaceLevel %x]
+0x0240F180  0x01DE5660    CTexture_D3D::CreateCubeTexture_FromMemory [D3DXSaveTextureToFile %x]
+0x0240F3A8  0x01DE67C0    CDepthStencilSurface_D3D::Create [CreateDepthStencilSurface %x]
+0x024071C0  0x01D8BBA0+   CIndexBuffer_D3D::LockIB [Lock %x]
+0x02407180  0x01D8BBA0    CIndexBuffer_D3D::CreateIB [CreateIndexBuffer %x]
+0x024071F4  -             CIndexBuffer_D3D::UnlockIB [Unlock %x]
+0x024072A0  0x01D8C260    CVertexBuffer_D3D::CreateVB [CreateVertexBuffer %x]
+0x024072E4  0x01D8C460    CVertexBuffer_D3D::LockVB [Lock %x]
+0x02407318  -             CVertexBuffer_D3D::UnlockVB [Unlock %x]
+0x0240EA84  0x01DE29C0    CIndexBufferPool_D3D::Init [%x]
+0x0240EAB4  -             CIndexBufferPool_D3D::LockIB [Lock %x]
+0x0240EAEC  -             CIndexBufferPool_D3D::UnlockIB [Unlock %x]
+0x0240EBA4  0x01DE3050    CVertexBufferPool_D3D::Init [%x]
+0x0240EBD4  -             CVertexBufferPool_D3D::LockVB [Lock %x]
+0x0240EC0C  -             CVertexBufferPool_D3D::UnlockVB [Unlock %x]
+0x02406E88  0x01D89780    CCapability_D3D::OnResetDevice [GetDeviceCaps %x]
+0x02406EC8  0x01D89780    CCapability_D3D::OnResetDevice [GetBackBuffer %x]
+0x02406F08  0x01D89850    CCapability_D3D::CollectDeviceCapability [GetAdapterIdentifier %x]
+0x02406F60  0x01D89850    CCapability_D3D::CollectDeviceCapability [GetDeviceCaps %x]
+0x02406FB0  0x01D89850    CCapability_D3D::CollectDeviceCapability [GetAdapterDisplayMode %x]
+0x02407008  0x01D89850    CCapability_D3D::CollectDeviceCapability [EnumAdapterModes %x]
+0x01F22EC4  -             CFont_D3D::Create [D3DXCreateFont %x]
+
+
+================================================================================
+13. WHAT NativeEngine HAS TO SATISFY (checklist derived from this reverse)
+================================================================================
+[X] StretchRect must SCALE (backbuffer -> 512x512). Implemented.
+[X] GetRenderTarget(0) must return the surface of the CURRENT target, not always
+    the backbuffer. Without this the Push/Pop stack of the engine is broken.
+[X] GetDepthStencilSurface must return the CURRENT depth, same reason.
+[X] Every texture created with D3DUSAGE_RENDERTARGET needs BIND_RENDER_TARGET and
+    its RTV (otherwise StretchRect and SetRenderTarget write nothing).
+[X] SetRenderTarget resets the viewport to the target size. Implemented.
+[ ] CreateCubeTexture returns NULL today; the game does create cube textures.
+[ ] D3DUSAGE_AUTOGENMIPMAP (0x400/0x401) with MipLevels=-1: ignored today.
+[X] CheckDeviceFormat must accept X8R8G8B8 (22) for the screen texture.
+[X] VB/IB Lock with an offset and with D3DLOCK_NOOVERWRITE/DISCARD: the pools of the
+    game depend on the offset being respected.
+[X] Present ignores the source/dest rects; the game passes NULL in the normal case.
+
+================================================================================
+14. FIXED-FUNCTION TEXTURE PIPELINE  (CTextureState_D3D)
+================================================================================
+This is what broke the flat sprites, the grey rectangles in Room Setting and the
+charge bar. The engine does NOT use .fx for everything: whatever has no pixel shader
+is resolved with the D3D9 texture stage states.
+
+CTextureState_D3D vtable = 0x024074A8 (20 methods, 0x01D8EC90 .. 0x01D8EB70)
+
+--- CTextureState_D3D::Apply  0x01D8E0C0 ---------------------------------------
+  Uploads the whole stage to the device:
+    dev->SetTextureStageState(stage, D3DTSS_COLOROP,   MapOp (m_colorOp))
+    dev->SetTextureStageState(stage, D3DTSS_COLORARG1, MapArg(m_colorArg1))
+    dev->SetTextureStageState(stage, D3DTSS_COLORARG2, MapArg(m_colorArg2))
+    dev->SetTextureStageState(stage, D3DTSS_ALPHAOP,   MapOp (m_alphaOp))
+    dev->SetTextureStageState(stage, D3DTSS_ALPHAARG1, MapArg(m_alphaArg1))
+    dev->SetTextureStageState(stage, D3DTSS_ALPHAARG2, MapArg(m_alphaArg2))
+    dev->SetSamplerState(stage, D3DSAMP_MINFILTER/MAGFILTER/MIPFILTER, MapFilter(..))
+    dev->SetSamplerState(stage, D3DSAMP_ADDRESSU/V/W,                  MapAddr(..))
+  Individual setters: 0x01D8E570 (COLOROP), 0x01D8E5E0 (COLORARG1/2),
+  0x01D8E7E0 (ALPHAOP), 0x01D8E850 (ALPHAARG1/2),
+  0x01D8EA50 (MIN/MAG/MIPFILTER), 0x01D8EB70 (ADDRESSU/V/W).
+  All of them do "if it did not change, do not send it" (compared against a cached
+  value).
+
+--- Internal enum -> D3D9 translators (each one a one-line LUT) -----------------
+  0x01D8ECF0  MapTexOp    -> table 0x0257001C
+  0x01D8ECD0  MapTexArg   -> table 0x02570040
+  0x01D8ECE0  MapFilter   -> table 0x02570008
+  0x01D8ECC0  MapAddress  -> table 0x02570014
+  0x01D8FE50  MapFillMode -> table 0x02570050
+  0x01D8FE40  MapCullMode -> table 0x02570058
+
+  TEXOP  @0x0257001C: 1 2 3 4 5 7 8 9 10 0
+     idx 0->D3DTOP_DISABLE(1)      idx 1->SELECTARG1(2)   idx 2->SELECTARG2(3)
+     idx 3->MODULATE(4)            idx 4->MODULATE2X(5)   idx 5->ADD(7)
+     idx 6->ADDSIGNED(8)           idx 7->ADDSIGNED2X(9)  idx 8->SUBTRACT(10)
+     ==> the engine uses ONLY these 9 operations. No DOTPRODUCT3, no LERP, no
+         BLEND*ALPHA, no MULTIPLYADD.
+
+  TEXARG @0x02570040: 0 1 2 3
+     D3DTA_DIFFUSE(0), D3DTA_CURRENT(1), D3DTA_TEXTURE(2), D3DTA_TFACTOR(3)
+     ==> only 4 arguments, and NEVER with the D3DTA_COMPLEMENT (0x10) or
+         D3DTA_ALPHAREPLICATE (0x20) modifiers.
+
+  FILTER @0x02570008: 0 1 2 1 3 1 2 3
+     0->NONE 1->POINT 2->LINEAR 3->POINT 4->ANISO 5->POINT 6->LINEAR 7->ANISO
+
+  ADDRESS@0x02570014: 1 3 1 2 3 4
+     0->WRAP 1->CLAMP 2->WRAP 3->MIRROR 4->CLAMP 5->BORDER
+     ==> the engine DOES ask for CLAMP. Forcing WRAP everywhere produces stripes.
+
+  FILLMODE @0x02570050: 0->D3DFILL_WIREFRAME(2) 1->D3DFILL_SOLID(3)
+  CULLMODE @0x02570058: 0->NONE(1) 1->CW(2) 2->CCW(3) 3->NONE(1)
+
+>>> CONSEQUENCE <<< A D3D11 backend has no fixed-function pipeline. The stage cascade
+has to be implemented in the pixel shader: per stage, pick the two arguments according
+to COLORARG1/2 and apply COLOROP; the same for alpha; and D3DTOP_DISABLE cuts the
+cascade. Four stages are enough. Without this everything comes out as a fixed
+MODULATE(texture, diffuse).
+
+================================================================================
+15. RENDER STATES  (CRenderState_D3D)
+================================================================================
+CRenderState_D3D vtable = 0x024074FC
+
+--- CRenderState_D3D::ApplyAll  0x01D8ED40 -------------------------------------
+Sends these 21 render states (the order is the one in the code):
+    D3DRS_FILLMODE(8)              D3DRS_CULLMODE(22)
+    D3DRS_DEPTHBIAS(195)           D3DRS_SLOPESCALEDEPTHBIAS(175)
+    D3DRS_POINTSIZE(154)           D3DRS_LOCALVIEWER(143)
+    D3DRS_NORMALDEGREE(168)        D3DRS_ZWRITEENABLE(14)
+    D3DRS_ZENABLE(7)               D3DRS_ZFUNC(23)
+    D3DRS_STENCILENABLE(52)        D3DRS_ALPHATESTENABLE(15)
+    D3DRS_ALPHAFUNC(25)            D3DRS_ALPHAREF(24)
+    D3DRS_ALPHABLENDENABLE(27)     D3DRS_SRCBLEND(19)
+    D3DRS_DESTBLEND(20)            D3DRS_STENCILPASS(55)
+    D3DRS_STENCILFUNC(56)          D3DRS_STENCILREF(57)
+    D3DRS_TEXTUREFACTOR(60)
+
+Individual setters:
+    0x01D8F180  SetFillMode        0x01D8F1E0  SetCullMode
+    0x01D8F240  SetDepthBias (float, D3DRS_DEPTHBIAS)
+    0x01D8F930  SetScissorRect (the only call to dev->SetScissorRect)
+    0x01D8FA10  stencil (PASS/FUNC/REF)   0x01D8FAF0  stencil + fillmode
+    0x01D8FB80  SetTextureFactor
+    0x01D8FF30  fog: FOGTABLEMODE(35), FOGCOLOR(34), FOGSTART(36), FOGEND(37)
+
+==> CULLMODE and ALPHATESTENABLE/ALPHAFUNC/ALPHAREF have to be honoured. Always
+    rasterizing with CULL_NONE makes the back faces z-fight with the front ones:
+    that is what striped the floor depending on the camera angle.
+
+================================================================================
+16. HOW TEXTURES ARE BOUND
+================================================================================
+Only 8 functions in the whole exe call IDirect3DDevice9::SetTexture. Three of them
+are in the vtable of the renderer:
+
+--- CRenderer_D3D::SetTexture  0x01C84020  (vtbl idx 42) -----------------------
+  SetTexture(stage, ITexture* tex)
+  if (this->m_texCache[stage] /* this+0x6A8 + stage*4 */ == tex) return;  // cache
+  this->m_texCache[stage] = tex;
+  if (tex) { if (this->m_bTextureEnable /* this+0x86 */) tex->Bind(stage); }
+  else     { if (this->m_bTextureEnable) dev->SetTexture(stage, NULL); }
+
+--- CRenderer_D3D::ClearTexture     0x01C840B0 (idx 43) ------------------------
+  if the cache of the stage is not null: cache=null and dev->SetTexture(stage, NULL)
+
+--- CRenderer_D3D::ClearAllTextures 0x01C84110 (idx 44) -----------------------
+  for (i = 0; i < 8; i++) { cache[i] = NULL; dev->SetTexture(i, NULL); }
+  ==> the engine reasons about 8 stages.
+
+--- CTexture_D3D::Bind  0x01DE5960 --------------------------------------------
+  dev->SetTexture(stage, this->m_pD3DTex /* this+0x60 */);
+
+  m_bTextureEnable (renderer+0x86) is set to 1 exactly once, in Init (0x01C80CF0),
+  and never cleared.
+
+================================================================================
+17. PIXELSHADER = NULL IN THE .fx FILES  (projected shadows)
+================================================================================
+effect_007.fx declares THREE techniques and all three have PixelShader = null:
+    Technique_TextureNoise         VS_TextureNoise
+    Technique_ProjectiveShadow     VS_ProjectiveShadow
+    Technique_ProjectiveShadowCast VS_ProjectiveShadowCast
+
+In D3D9 PixelShader = null does NOT mean "do not draw": it means the pixel is
+resolved by the FIXED-FUNCTION pipeline (the texture stages of section 14) with the
+vertex shader of the effect. The VS are:
+    VS_ProjectiveShadow:     pos = mul(InPosition, g_matWVP)
+                             color = InDiffuseColor ; uv = InDiffuseMapUV
+    VS_ProjectiveShadowCast: pos = mul(InPosition, g_matWVP)
+                             uv  = mul(InPosition, g_matTexture).xy   <- projective texgen
+    VS_TextureNoise:         uv  = mul(InDiffuseMapUV, (float3x3)g_matTexture).xy
+
+==> A backend that requires VS+PS will mark these passes as "not compilable" and skip
+    them. The correct thing is: the VS of the effect + a fixed-function pixel shader.
+
+================================================================================
+18. CLASS -> VTABLE INDEX  (resolved by RTTI)
+================================================================================
+Method: the TypeDescriptor starts 8 bytes before the `.?AV...` string; the
+_RTTICompleteObjectLocator references it at +0x0C; and vtable[-1] points at the COL.
+
+  .?AV?$CComponentCreator@VCFont_Bitmap@Renderer@CoreLib@@@BaseLib@@ vtable=023E1958
+  .?AV?$CComponentCreator@VCFont_D3D@Renderer@CoreLib@@@BaseLib@@ vtable=023E1A4C
+  .?AV?$CComponentCreator@VCFont_FreeType@Renderer@CoreLib@@@BaseLib@@ vtable=0240FD54
+  .?AV?$CComponentCreator@VCIndexBuffer_D3D@Renderer@CoreLib@@@BaseLib@@ vtable=02407270
+  .?AV?$CComponentCreator@VCRenderStateProp@CoreLib@@@BaseLib@@  vtable=0240D740
+  .?AV?$CComponentCreator@VCRenderable@Scene@CoreLib@@@BaseLib@@ vtable=023FEED8
+  .?AV?$CComponentCreator@VCTexture_D3D@Renderer@CoreLib@@@BaseLib@@ vtable=0240F25C
+  .?AV?$CComponentCreator@VCVertexBuffer_D3D@Renderer@CoreLib@@@BaseLib@@ vtable=024073A8
+  .?AV?$CSingleton@VIRenderer@Renderer@CoreLib@@@BaseLib@@       vtable=023DF468
+  .?AV?$CVtxStream@USVtxP@Renderer@CoreLib@@@Renderer@CoreLib@@  vtable=01F3B818
+  .?AV?$CVtxStreamEx@USVtxP@Renderer@CoreLib@@@Renderer@CoreLib@@ vtable=023FD338
+  .?AV?$CVtxStreamEx@USVtxPC@Renderer@CoreLib@@@Renderer@CoreLib@@ vtable=023FFF4C
+  .?AV?$CVtxStreamEx@USVtxPCT1@Renderer@CoreLib@@@Renderer@CoreLib@@ vtable=023FFF7C
+  .?AV?$CVtxStreamEx@USVtxPCT2@Renderer@CoreLib@@@Renderer@CoreLib@@ vtable=023FFFAC
+  .?AV?$CVtxStreamEx@USVtxPN@Renderer@CoreLib@@@Renderer@CoreLib@@ vtable=023FFFDC
+  .?AV?$CVtxStreamEx@USVtxPNC@Renderer@CoreLib@@@Renderer@CoreLib@@ vtable=0240006C
+  .?AV?$CVtxStreamEx@USVtxPNCT1@Renderer@CoreLib@@@Renderer@CoreLib@@ vtable=0240009C
+  .?AV?$CVtxStreamEx@USVtxPNCT2@Renderer@CoreLib@@@Renderer@CoreLib@@ vtable=024000CC
+  .?AV?$CVtxStreamEx@USVtxPNT1@Renderer@CoreLib@@@Renderer@CoreLib@@ vtable=0240000C
+  .?AV?$CVtxStreamEx@USVtxPNT2@Renderer@CoreLib@@@Renderer@CoreLib@@ vtable=0240003C
+  .?AV?$CVtxStreamEx@USVtxPNT_Bump@Renderer@CoreLib@@@Renderer@CoreLib@@ vtable=024000FC
+  .?AV?$CVtxStreamEx@USVtxPNT_BumpSkin@Renderer@CoreLib@@@Renderer@CoreLib@@ vtable=0240015C
+  .?AV?$CVtxStreamEx@USVtxPNT_Skin@Renderer@CoreLib@@@Renderer@CoreLib@@ vtable=0240012C
+  .?AV?$CVtxStreamEx@USVtxPT1@Renderer@CoreLib@@@Renderer@CoreLib@@ vtable=023FFEEC
+  .?AV?$CVtxStreamEx@USVtxPT2@Renderer@CoreLib@@@Renderer@CoreLib@@ vtable=023FFF1C
+  .?AVCBackgroundRenderCallback@Game@@                           vtable=01F3A358
+  .?AVCBufferManager_D3D@Renderer@CoreLib@@                      vtable=02407140
+  .?AVCCapability_D3D@Renderer@CoreLib@@                         vtable=0240705C
+  .?AVCDebugRender@Debug@NavMeshLib@@                            vtable=02425BEC
+  .?AVCDepthStencilSurface_D3D@Renderer@CoreLib@@                vtable=0240F3FC
+  .?AVCDepthStencilSurface_D3D@Renderer@CoreLib@@                vtable=0240F418
+  .?AVCFog_D3D@Renderer@CoreLib@@                                vtable=02407580
+  .?AVCFontManager_D3D@Renderer@CoreLib@@                        vtable=02407404
+  .?AVCFont_Bitmap@Renderer@CoreLib@@                            vtable=023E1894
+  .?AVCFont_Bitmap@Renderer@CoreLib@@                            vtable=023E1948
+  .?AVCFont_D3D@Renderer@CoreLib@@                               vtable=023E19AC
+  .?AVCFont_D3D@Renderer@CoreLib@@                               vtable=023E1A3C
+  .?AVCFont_FreeType@Renderer@CoreLib@@                          vtable=0240FC90
+  .?AVCFont_FreeType@Renderer@CoreLib@@                          vtable=0240FD44
+  .?AVCIMMRenderTex2_D3D@Renderer@CoreLib@@                      vtable=024070F8
+  .?AVCIMMRender_D3D@Renderer@CoreLib@@                          vtable=024070B8
+  .?AVCIndexBufferPoolContainer_D3D@Renderer@CoreLib@@           vtable=0240EB7C
+  .?AVCIndexBufferPool_D3D@Renderer@CoreLib@@                    vtable=0240EB40
+  .?AVCIndexBuffer_D3D@Renderer@CoreLib@@                        vtable=02407230
+  .?AVCLightManager_D3D@Renderer@CoreLib@@                       vtable=024073B0
+  .?AVCMatrixManager_D3D@Renderer@CoreLib@@                      vtable=024073D8
+  .?AVCRenderStateProp@CoreLib@@                                 vtable=0240D6FC
+  .?AVCRenderState_D3D@Renderer@CoreLib@@                        vtable=024074FC
+  .?AVCRenderTargetActNodeLoader@Game@@                          vtable=01F3E8C8
+  .?AVCRenderTargetActNodeLoader_IF@Game@@                       vtable=01F3E984
+  .?AVCRenderTargetCallback@Game@@                               vtable=01F3A368
+  .?AVCRenderTargetManager_D3D@Renderer@CoreLib@@                vtable=024076F8
+  .?AVCRenderTarget_D3D@Renderer@CoreLib@@                       vtable=0240F37C
+  .?AVCRenderTarget_D3D@Renderer@CoreLib@@                       vtable=0240F39C
+  .?AVCRenderable@Scene@CoreLib@@                                vtable=023FED28
+  .?AVCRenderer_D3D@Renderer@CoreLib@@                           vtable=023DF9A0
+  .?AVCSpatialRender@CoreLib@@                                   vtable=0240E144
+  .?AVCTextureDispatch@Renderer@CoreLib@@                        vtable=023E1528
+  .?AVCTextureManager_D3D@Renderer@CoreLib@@                     vtable=0240745C
+  .?AVCTextureState_D3D@Renderer@CoreLib@@                       vtable=024074A8
+  .?AVCTexture_D3D@Renderer@CoreLib@@                            vtable=0240F1D8
+  .?AVCVertexBufferPoolContainer_D3D@Renderer@CoreLib@@          vtable=0240EC88
+  .?AVCVertexBufferPool_D3D@Renderer@CoreLib@@                   vtable=0240EC4C
+  .?AVCVertexBuffer_D3D@Renderer@CoreLib@@                       vtable=02407354
+  .?AVIBufferManager@Renderer@CoreLib@@                          vtable=0240EA70
+  .?AVICapability@Renderer@CoreLib@@                             vtable=0240EA14
+  .?AVIDepthStencilSurface@Renderer@CoreLib@@                    vtable=0240FDB8
+  .?AVIDepthStencilSurface@Renderer@CoreLib@@                    vtable=0240FDD4
+  .?AVIFog@Renderer@CoreLib@@                                    vtable=0240F33C
+  .?AVIFont@Renderer@CoreLib@@                                   vtable=023FBA1C
+  .?AVIFont@Renderer@CoreLib@@                                   vtable=023FBAAC
+  .?AVIFontManager@Renderer@CoreLib@@                            vtable=0240ED74
+  .?AVIFont_Cache@Renderer@CoreLib@@                             vtable=023FB7C0
+  .?AVIFont_Cache@Renderer@CoreLib@@                             vtable=023FB874
+  .?AVIIMMRender@Renderer@CoreLib@@                              vtable=0240D644
+  .?AVIIMMRenderTex2@Renderer@CoreLib@@                          vtable=0240D684
+  .?AVIIndexBuffer@Renderer@CoreLib@@                            vtable=02407780
+  .?AVILightManager@Renderer@CoreLib@@                           vtable=0240ED18
+  .?AVIMatrixManager@Renderer@CoreLib@@                          vtable=0240ED40
+  .?AVIRenderCallback@Renderer@CoreLib@@                         vtable=01F39F90
+  .?AVIRenderSetting@Utility@Game@@                              vtable=01F6A94C
+  .?AVIRenderState@Renderer@CoreLib@@                            vtable=0240F2B8
+  .?AVIRenderTarget@Renderer@CoreLib@@                           vtable=0240FD88
+  .?AVIRenderTarget@Renderer@CoreLib@@                           vtable=0240FDA8
+  .?AVIRenderTargetManager@Renderer@CoreLib@@                    vtable=0240F354
+  .?AVIRenderer@Renderer@CoreLib@@                               vtable=023DF470
+  .?AVIRendererObject@Renderer@CoreLib@@                         vtable=023FB580
+  .?AVITexture@Renderer@CoreLib@@                                vtable=023E14A8
+  .?AVITextureManager@Renderer@CoreLib@@                         vtable=023FFE98
+  .?AVITextureState@Renderer@CoreLib@@                           vtable=0240F264
+  .?AVIVertexBuffer@Renderer@CoreLib@@                           vtable=0240ECC8
+  .?AVIVtxStream@Renderer@CoreLib@@                              vtable=01F3B7A0
+
+
+NOTE: several tables sit back to back in memory, so the detected length can include
+the next vtable. The real cut is where a data pointer appears (the COL of the class
+that follows). E.g. CTextureState_D3D ends at 0x024074F8 and CRenderState_D3D starts
+at 0x024074FC.
+
+================================================================================
+19. UPDATED CHECKLIST
+================================================================================
+[X] StretchRect scales (backbuffer -> 512x512). Verified at runtime:
+    dst=512x512 tex=1 rtv=1 src=1920x1080.
+[X] GetRenderTarget/GetDepthStencilSurface return the CURRENT target.
+[X] D3DUSAGE_RENDERTARGET -> BIND_RENDER_TARGET + RTV.
+[X] SetRenderTarget resets the viewport to the target size.
+[X] Fixed-function texture stage pipeline (9 ops, 4 args, 4 stages).
+[X] SetSamplerState: ADDRESSU/V/W and MIN/MAG/MIPFILTER per stage.
+[X] D3DRS_CULLMODE and D3DRS_FILLMODE in the rasterizer.
+[X] Alpha test in the fixed-function path.
+[X] Passes with PixelShader = null: the effect's VS + a fixed-function PS.
+[X] Present honours D3DPRESENT_PARAMETERS.PresentationInterval (it was pinned to
+    vsync, so unlocking the fps cap still gave 60).
+[X] Render states declared by a .fx pass are applied.
+[X] Texture stage state types >= 8 are kept (TEXCOORDINDEX is 11 and
+    TEXTURETRANSFORMFLAGS is 24), and the D3DTS_TEXTURE0..7 matrices are stored.
+[ ] The texture coordinate transform itself is not applied yet in the shader.
+[ ] CreateCubeTexture returns NULL; the game does create cube textures
+    (CTexture_D3D::CreateCubeTexture_FromMemory @0x01DE5660).
+[ ] D3DUSAGE_AUTOGENMIPMAP (0x400/0x401) with MipLevels=-1: ignored.
+[ ] Fixed-function lighting: SetMaterial/SetLight/LightEnable/D3DRS_AMBIENT and
+    D3DRS_DIFFUSEMATERIALSOURCE are no-ops.
+[ ] Stencil: the engine sets STENCILENABLE/PASS/FUNC/REF and we do not emulate it.
+[ ] SetClipPlane / D3DRS_CLIPPLANEENABLE: not emulated (D3D11 would do it with
+    SV_ClipDistance). Still to confirm whether the engine really uses them.
+[ ] SetVertexShaderConstantF / SetPixelShaderConstantF are stubs. They only matter
+    if the game drives shaders without going through ID3DXEffect; not observed.
+
+ENVIRONMENT NOTE: the D3D11 debug layer (D3D11_3SDKLayers.dll) used to be enabled
+always. It validates every call and tracks every resource: in a 32-bit client already
+working close to its memory ceiling, it ended in an AV inside the layer's own heap
+when entering a channel. It is now only enabled with NE_D3D11_DEBUG=1.
+
+================================================================================
+20. TEXTURE SUBSYSTEM
+================================================================================
+Resolved by RTTI, same as section 18.
+
+--- Renderer textures ---------------------------------------------------------
+  ITexture                              vtable=023E14A8
+  CTexture_D3D                          vtable=0240F1D8   (see section 7)
+  ITextureManager                       vtable=023FFE98
+  CTextureManager_D3D                   vtable=0240745C
+  ITextureState                         vtable=0240F264
+  CTextureState_D3D                     vtable=024074A8   (see section 14)
+  CTextureDispatch                      vtable=023E1528
+  CComponentCreator<CTexture_D3D>       vtable=0240F25C
+
+--- Texture properties (the engine's property system) --------------------------
+  CTextureAlphaProp                     vtable=023FEB70
+  CTextureColorProp                     vtable=023FEBE4
+  CTextureFilterProp                    vtable=02400A58
+  CTextureStateProp                     vtable=0240D7DC
+  CTextureWrapProp                      vtable=023FEC58
+  Each with its own CComponentCreator (023FEBB4, 023FEC28, 02400A9C, 0240D820,
+  023FEC9C).
+  ==> These are what end up translated into the texture stage states and sampler
+      states of section 14: Filter/Wrap feed D3DSAMP_*, Alpha/Color feed
+      D3DTSS_ALPHAOP / D3DTSS_COLOROP.
+
+--- Textures animated by SEQUENCE  <<< the weapon and effect path >>> ----------
+  CSequence_NodeLoaderTextureProperty   vtable=0240BF88
+  CNodeLoaderTexture                    vtable=024006FC   (Create)
+  CNodeLoaderTextureController          vtable=023E250C   (ReloadTexture)
+  CParticleTexture                      vtable=02407D50   (Create)
+  CParticleTextureController            vtable=02407D7C   (ReloadTexture)
+
+  The texture of these effects is NOT fixed by the material: the SEQUENCE changes it
+  per animation frame.
+      .seq  -> CSequence_NodeLoaderTextureProperty
+            -> CNodeLoaderTextureController::ReloadTexture
+            -> CNodeLoaderTexture (the texture of the .scn node)
+  Concrete example: the wall jump is basic_walljump.scn animated by
+  basic_wall_jump.seq. It should look like a sphere with a radial glow and a cyan
+  hexagon honeycomb in the middle.
+
+--- Effect textures (the engine's FX system, not the D3D .fx files) -----------
+  CFX_TextureProperty                   vtable=02406CEC
+  CFX_TextureFileProperty               vtable=02406B0C
+  CFX_TextureCoordProperty              vtable=02406D64
+
+--- UI and debug --------------------------------------------------------------
+  CGUI_SkinTextureCoordProperty         vtable=02408738
+  CDumpTextureInfo                      vtable=01F19A04
+  CSaveFontTexture                      vtable=01F19F74
+
+--- Error strings -> function (the ones that were missing) --------------------
+  0240EEA8 / 0240EF30  CTexture_D3D::CreateTexture_FromMemory      01DE53A0
+  0240EE58             CTexture_D3D::CreateTexture_ColorTarget     01DE5240
+  0240EE08             CTexture_D3D::CreateTexture                 01DE50E0
+  0240EF90 / 0240F030  CreateCubeTexture_FromMemory                01DE5660
+  0240F098             [ LockRect ]                                01DE59A0
+  0240F0E0             [ UnlockRect ]                              01DE5A60
+  0240F130             [ GetSurfaceLevel ]                         01DE5AB0
+  0240F180             [ D3DXSaveTextureToFile ]                   01DE5B10
+  023DF8D0/914/958     CRenderer_D3D::UpdateScreenTexture          01C84680
+  023FB736             IFont_Cache::IFont_Cache [TextureFormat Not Support!!]
+
+  WATCH OUT for 0x01DE5A60: it is CTexture_D3D::UnlockRect (it calls
+  m_pTex->UnlockRect(0), vtable idx 20) but it logs with the
+  CreateCubeTexture_FromMemory string. The string is REUSED: do not confuse the
+  function with the name in the message. This is the function that showed up in the
+  stack of the crash when entering a channel.
+
+================================================================================
+21. FOG: REAL VALUES, WHERE THEY COME FROM AND HOW TO IMPLEMENT IT
+================================================================================
+Fog is NOT hardcoded: it comes from the map's .ini. From a map bginfo file:
+
+  [RENDERER]
+  CullDist=20000
+  FogMinDist=2000
+  FogMaxDist=9900
+  FogColorR=0.2   FogColorG=0.2   FogColorB=0.3
+  ShadowColorR/G/B=0.0
+  LightColorR/G/B=1    LightIntensity=100000
+  InGameLightPos=(0, 3000, -5539.826)
+  LobbyLightPos=(-3051, 12433, 6307)
+  ShadeMapTexture=Resources/Image/nightlight01.tga
+
+The names FOG_MINDIST / FOG_MAXDIST / FOG_R / FOG_G / FOG_B live at
+0x01F37F30..0x01F37F58, and CFogPropertyCommand@Game@@ is what applies them.
+
+VERIFIED AT RUNTIME (SetRenderState log): the engine DOES send them to the device.
+  D3DRS_FOGTABLEMODE = 3           -> D3DFOG_LINEAR (PER PIXEL fog)
+  D3DRS_FOGSTART = 0x44FA0000      -> 2000.0  (matches FogMinDist=2000)
+  D3DRS_FOGEND   = 0x466A6000      -> 15000.0 (varies; 0x47435000 = 50000.0)
+  D3DRS_FOGCOLOR = 0xFF338CFF      -> (51,140,255) sky blue
+                   0xFF123375      -> (18,51,117) dark blue
+  D3DRS_FOGENABLE toggles 0/1 PER OBJECT
+
+  IMPORTANT: the startup values (start=0, end=9984, WHITE colour) are DEFAULTS, not
+  the in-match ones. They have to be measured inside the map. With the default range
+  the blend at 500 units is 5%: invisible.
+
+HOW TO IMPLEMENT IT IN D3D11
+D3D9 applies fog in a FIXED unit AFTER the pixel shader. D3D11 has no such thing and
+the game's .fx files do not implement it (zero mentions of fog in the 63KB of the
+world shader), so it has to be injected into the pixel shader.
+
+FAILED ATTEMPT (do not repeat): reading `In.Position.w` inside the PS. The input
+structs have no member called Position, so the wrapper does not compile
+("error X3018: invalid subscript 'Position'"). And worse: the fog wrapper shared a
+function with the alpha test one, so when the fallback kicked in those passes were
+left without alpha test too and the UI broke.
+  => Lesson: each wrapper needs its OWN fallback level.
+     Correct chain: fog -> alpha test only -> original entry.
+
+ALSO FAILS: adding our own `float4 neVP : SV_Position` parameter. Under backwards
+compatibility the POSITION semantic the struct already carries maps to SV_Position,
+and D3DCompile rejects the duplicate ("X4574: Duplicate system value semantic").
+
+WHAT WORKS: find whichever member of the input struct carries the POSITION semantic
+and read its w. In a pixel shader that w is 1/w, so the view depth is its reciprocal:
+
+  float4 <entry>_NEFOG(<Struct> In) : COLOR {
+      float4 c = <entry>_NEAT(In);
+      if (g_NE_Fog.z > 0.5) {
+          float d = 1.0 / max(In.<posMember>.w, 1e-8);
+          float f = saturate((g_NE_Fog.y - d) / max(g_NE_Fog.y - g_NE_Fog.x, 0.001));
+          c.rgb = lerp(g_NE_FogColor.rgb, c.rgb, f);
+      }
+      return c;
+  }
+
+The fog constants must NOT live in $Globals: the effect's cbuffer is uploaded once per
+BeginPass, and the game toggles FOGENABLE per object, so reading it there gives the
+wrong answer for most draws. They ride their own cbuffer at b1 which the backend
+refills on every draw with the real per-object value. The UI draws with fog off, so
+the wrapper is inert for it.
+
+================================================================================
+22. WHY A WHITE SQUARE SHOWED UP ON THE RAILGUN / DAGGER / WALL JUMP
+================================================================================
+The shader of that effect (dump 0x023F8288) does ONE thing:
+
+    float4 FinalColor = tex2Dproj( SceneMapSampler, ... );
+    return FinalColor;
+
+It has no colour of its own and no diffuse texture: the only thing it paints is the
+distorted SCENE TEXTURE (it derives a normal from the luminance gradient and offsets
+the coordinates). Its technique also declares `AlphaBlendEnable = false`, i.e. the quad
+is written OPAQUE on purpose; in the original you cannot tell, because what it paints is
+almost identical to what is behind it.
+
+Our fallback for a texture that does not resolve was WHITE (the neutral element of a
+multiplication). But here nothing is multiplied, it is returned as-is: neutral white in
+a shader that only returns that texture = OPAQUE WHITE SQUARE.
+
+Fix: we do have the scene texture (the 512x512 one that UpdateScreenTexture fills,
+section 4). The backend remembers its SRV when it sees the StretchRect whose
+destination is 512x512, and any sampler whose name contains Scene / Screen / Refraction
+gets it instead of the white one.
+
+--- 22.b THE SAME SYMPTOM IS MAP DEPENDENT ------------------------------------
+The white square on the basic (non-skin) Mind Shock / Mind Heal and on the railgun
+charge is NOT constant across maps. On Station 2 the railgun charge renders correctly
+(radial arc gauge plus glow); on other maps the very same weapon gives the white square.
+
+Maps where the effects render CORRECTLY, confirmed in game so far:
+    Station 1, Station 2, Wonderland, Ice Square, Neden 3
+There are more; they simply have not been verified yet. That is the list of what has
+actually been seen working, not the complete set. Diffing the bginfo [RENDERER] block of
+these against a map where it fails is the cheapest next step.
+
+That rules the weapon out: the effect is the same asset either way. What changes between
+maps is the environment the effect samples from, which is exactly what this section is
+about:
+  - the contents of the scene / refraction texture at the moment the effect draws,
+  - the `[RENDERER]` block of the map's bginfo (fog range and colour, shademap texture,
+    light position — section 21),
+  - which post-process passes the map runs, and therefore what device state is left
+    around the effect's draw.
+So the thing to compare is not two weapons, it is two maps: on a map where it works
+against a map where it does not, which SRV lands on the scene sampler and which render
+states the surrounding passes left behind.
+
+================================================================================
+23. PERFORMANCE: WHAT WAS FOUND AND WHAT IS LEFT
+================================================================================
+[X] The D3D11 debug layer (D3D11_3SDKLayers.dll) was ALWAYS on. It validates every call
+    and tracks every resource; in a 32-bit client close to its memory ceiling it ended
+    in an AV inside its own heap when entering a channel. Now only with
+    NE_D3D11_DEBUG=1.
+[X] Dumping the backbuffer to BMP every 60 frames: it created a full-screen staging
+    texture and mapped it for READING (which syncs with the GPU) plus 8MB to disk per
+    second. Now only with NE_DUMP_BB=1.
+[X] Present pinned to SyncInterval=1: with the fps cap unlocked it still gave 60. It now
+    honours PresentationInterval (the client asks for
+    D3DPRESENT_INTERVAL_IMMEDIATE = 0x80000000).
+[X] Swapchain with BufferCount=1 and SWAP_EFFECT_DISCARD: with a single back buffer the
+    CPU cannot run ahead of the GPU. Now FLIP_DISCARD with 2 buffers.
+[X] Unlocking vertex/index buffers uploaded the WHOLE buffer. The engine uses POOLS
+    (CVertexBufferPool_D3D / CIndexBufferPool_D3D) and locks a small range per draw. It
+    now uploads only the locked range, with WRITE_NO_OVERWRITE unless the game passes
+    D3DLOCK_DISCARD.
+
+[ ] NONE of them moved the needle clearly. The scene is ~160 draws per frame, which
+    should give thousands of fps, so the cost is elsewhere. MEASURE before touching
+    anything else: there is a [perf] counter that prints the frame time in ms and what
+    percentage of it is spent INSIDE the backend.
+    NOTE: Log() uses wvsprintfA and does NOT support %f or %g. Everything has to be
+    logged as integers (that is why it used to print "frame=fms" and "default X = g").
+    Already converted to integers.
+
+--- NOTE: the railgun and the wall jump are BOTH .seq ------------------------
+The two effects that came out as a white square (the railgun charge and the wall jump)
+are sequences, not fixed materials. That puts them on the path of section 20: the
+texture is swapped per frame by CSequence_NodeLoaderTextureProperty.
+
+CONSEQUENCE FOR THE DIAGNOSIS: the scene texture fallback (section 22) may NOT be the
+fix for these two. It only applies if the pass that draws them uses the distortion
+shader (the one doing tex2Dproj(SceneMapSampler,...)). If instead they use a normal
+shader with the node's texture, then what fails is that the texture the sequence loads
+never gets bound, and that is where to look.
+
+HOW TO CONTINUE (without guessing):
+ 1. Open basic_walljump.scn and basic_wall_jump.seq with the .scn/.seq reader and write
+    down WHICH texture the sequence asks for per frame.
+ 2. Log which texture ends up bound in that draw in our backend (there is already a
+    [flat] log for draws with no texture, and "[fx] texture NOT resolved" for samplers
+    that do not resolve).
+ 3. Compare the two. If the sequence asks for a texture that never shows up in our
+    CreateTexture, the problem is loading, not binding.
+Visual reference of the correct result: a sphere with a white/violet radial glow and a
+cyan hexagon honeycomb in the middle.
+
+================================================================================
+24. .scn FILES ENCODE THE RENDER STATES IN THE MATERIAL NAME
+================================================================================
+Found in the extracted resources/effects folder.
+The material name of each submesh is NOT a name: it is the list of states.
+
+  basic_walljump.scn  ->  "nolight alphablend2 nocull nofog nodepthwrite 001"
+                          texture: tick2_blue.bmp
+  (the same pattern with underscores shows up in the .exe:
+   "Object01 nolight_nofog_alphablend1_billboard")
+
+TOKENS AND HOW OFTEN THEY APPEAR ACROSS EVERY .scn IN effects/:
+  alphablend2    2159      <- the dominant mode in effects
+  nodepthwrite   2010
+  nocull         1998
+  nofog          1939
+  nolight        1814
+  light           606
+  alphablend1     250
+  billboard        80
+  alphablend0       8
+
+Reading: there are THREE blend modes (0/1/2). By the proportions, alphablend2 is the
+effects one (glow/particles, almost certainly additive), alphablend1 the normal alpha
+blend and alphablend0 opaque. The rest map straight through:
+  nolight      -> no lighting
+  nocull       -> D3DCULL_NONE
+  nofog        -> D3DRS_FOGENABLE = false   (see section 21)
+  nodepthwrite -> D3DRS_ZWRITEENABLE = false
+  billboard    -> the node orients itself towards the camera
+
+WHY IT MATTERS: the engine reads these tokens and derives the draw's render states from
+them. We already honour SRCBLEND/DESTBLEND/CULLMODE/ZWRITEENABLE when the game sets
+them, so this path should work by itself; but if an effect comes out with the wrong
+blend, THIS is where to look first, not in the shader.
+
+LOADING DETAIL: the .scn asks for "tick2_blue.bmp" but what is on disk is
+"tick2_blue.dds". The engine substitutes the extension when resolving the resource. If
+an effect texture ever goes missing, check that substitution before anything else.
+
+================================================================================
+25. "THE MAP LOOKS BRIGHTER / FLATTER": THE CLUE IS DifPow, NOT THE FOG
+================================================================================
+World lighting formula (effect_001.fx):
+
+    float3 L     = normalize( g_vLightPos - tmpPos );     // in the VERTEX shader
+    float4 Final = DiffuseMapColor * ( g_vLightColor * ( In.DifPow + 0.5 ) );
+
+  variants: ... * g_TexFactor,  ... + SpecularMapColor * In.SpePower,
+            ... * ( LightMapColor * 2 ),  ... * ( g_vLightColor * ShadeColor * 2 )
+
+In.DifPow is the diffuse term (N.L) computed by the VS. The effective range of the
+multiplier is 0.5 .. 1.5.
+
+  ==> If DifPow comes out SATURATED at 1 everywhere, the whole map sits at 1.5x with NO
+      variation: brighter and flat. It is not "more light", it is that the contrast
+      between what is lit and what is not has been lost.
+
+RULED OUT WITH EVIDENCE: g_Contrast / g_Saturation. The log shows them unbound (=N), but:
+  - g_Contrast = 0 cancels its term: it is neutral.
+  - g_Saturation = 0 would give a BLACK AND WHITE image, and that does not happen.
+  - the active techniques are PS_DiffuseMap_Light0 / _Light1, NOT the
+    _ContrastSaturation variants.
+So those two uniforms are not the cause.
+
+SUSPECT: the vertex NORMAL. If InNormal does not reach the VS correctly, N.L is constant
+and DifPow is fixed. World geometry goes through SetVertexDeclaration (the DIP ->
+BuildInputLayout path from the declaration, not from the FVF).
+
+NEXT CHECK (one pass, no guessing):
+ 1. Log the D3DVERTEXELEMENT9 that arrives in SetVertexDeclaration for the world draws
+    and confirm there is a D3DDECLUSAGE_NORMAL with the right type and offset, and that
+    BuildInputLayout maps it to "NORMAL".
+ 2. Compare the g_vLightPos / g_vLightColor the shader receives against the [RENDERER]
+    block of the map's bginfo (LightColor=(1,1,1), LightIntensity=100000,
+    InGameLightPos=(0,3000,-5539.826)). Watch the SCALE of the intensity.
+ 3. If the normal is right and the light is right, look at how the VS computes DifPow
+    (it may depend on a world/normal matrix we are not passing the same way).
+
+================================================================================
+26. FOG: WHAT IS CONFIRMED AND WHAT IS LEFT
+================================================================================
+CONFIRMED WORKING:
+  - The map's values reach the device (section 21).
+  - NE_FogState reads them correctly.
+  - The _NEFOG wrapper and its fallback chain are in place.
+  - The whole pipe is proven: forcing a fixed blend in the shader (f = 0.5, ignoring
+    distance) with NE_FOG_FORCE=1 makes fog VISIBLE, even across the screen. So the
+    constants reach the PS, _NEFOG runs, and the lerp with g_NE_FogColor is applied.
+
+BUG FOUND AND FIXED: AlphaTestWrapper was missing `atStruct = sname;`. Without that line
+atStruct stayed empty, CompileOne's condition was never met and the compiled entry was
+ALWAYS <entry>_NEAT, never <entry>_NEFOG. In other words the fog code existed but was
+NOT USED. That is why forcing FOGENABLE (NE_FOG_FORCE=1) did nothing either.
+  Verified with the log "[fx] PS <entry> -> compiled entry: <ent>".
+
+WHAT IS LEFT IS THE DEPTH: `In.Position.w` does not give the view distance, so f
+saturates at 1 and nothing blends. What has been tried:
+  1. an extra `float4 neVP : SV_Position` parameter -> DOES NOT COMPILE (it clashes with
+     the `Position : POSITION` member the input struct already declares).
+  2. `In.Position.w` from the struct                -> COMPILES but the value is not the
+     view depth (f = 1 always).
+Next to try, in this order:
+  a) pass the depth from the VERTEX shader in a spare TEXCOORD; this means wrapping the
+     VS too, but it is the only thing that guarantees the right value.
+  b) reconstruct it from the depth buffer in a separate pass.
+
+Nothing is broken in the meantime: the fallback chain (fog -> alpha test only ->
+original entry) works, the log confirms it and the UI is intact. Fog can be iterated on
+without risk.
+
+================================================================================
+27. S4'S LIGHTING IS A SHADEMAP (a texture lookup), NOT A FORMULA
+================================================================================
+Shader 0x023E4198 (VS_DiffuseMap_ShadeMap_Light1), with PixelShader = null:
+
+    float3 tmpNormal   = normalize( mul( InNormal, (float3x3)g_matWorld ) );
+    float3 L           = normalize( g_vLightPos - tmpPos );
+    Out.ShadeMapUV     = 0.5 * dot( tmpNormal, L ) + 0.5;
+
+The diffuse term N.L is NOT used as a number: it is remapped to 0..1 and used as a
+TEXTURE COORDINATE. The pixel is resolved by the FIXED-FUNCTION pipeline (section 14)
+sampling the ShadeMap with that UV. It is toon-style shading: the light ramp lives in a
+texture.
+
+  The map declares it in its .ini:  ShadeMapTexture=Resources/Image/nightlight01.tga
+
+>>> LIKELY CAUSE OF THE "FLAT AND BRIGHTER MAP" <<<
+Our log was already reporting:
+    [fx] texture NOT resolved: sampler=ShadeMapSampler tex=g_TexShadeMap slot=1
+If the ShadeMap does not resolve, the fallback gives a UNIFORM 0.5 grey. A constant
+ShadeMap means flat, even lighting across the whole map, with no contrast between what
+is lit and what is not. That matches the symptom exactly.
+
+NOTE: this technique has PixelShader = null, so it goes through OUR fixed-function
+pixel shader, which takes its textures from d->tex[stage] (device SetTexture) and NOT
+from the effect's texParams. Which of the two routes nightlight01.tga arrives by (or
+should arrive by) has to be verified.
+
+STEPS:
+ 1. Check whether nightlight01.tga is loaded at all (look for it in the CreateTexture
+    log).
+ 2. Check what sits in d->tex[1] during these draws (the ShadeMap goes to slot 1).
+ 3. If it arrives by neither route, the problem is loading the map's resource, not
+    binding it.
+
+================================================================================
+28. THE POST-PROCESSES, ONE BY ONE
+================================================================================
+0x023E4198  ShadeMap (see section 27). PixelShader = null.
+            Out.ShadeMapUV = 0.5 * dot(N, L) + 0.5  -> the LIGHT is a texture.
+
+0x023E26B8  TextureNoise + ProjectiveShadow + ProjectiveShadowCast.
+            All THREE with PixelShader = null (section 17).
+
+0x023F9870  Only offsets the UV (InDiffuseMapUV + g_TexCoordOffset).
+            PixelShader = null: another pass resolved by the fixed function.
+
+0x023E4198 / 0x023F7B50  Heat distortion. The 0x023F7B50 one uses tex2D (not tex2Dproj)
+            and ends with FinalColor.a = 1: OPAQUE ON PURPOSE. Just like the one in
+            section 22, the only thing it paints is the distorted scene texture, so if
+            that texture does not resolve the whole quad shows up in the fallback
+            colour.
+
+0x023E3A28  8-tap blur: sums 8 samples at +-0.005 and multiplies by 0.2.
+0x023E33D8  5-tap blur with weights g_fOrgColorRev / g_fPeriColorRev and a final
+            multiplier g_fColorRev. If those floats do not arrive, the result is BLACK
+            (everything gets multiplied by zero).
+0x023E2C38  Radial motion blur: the offsets come from Out.Position in the VS, and
+            FinalColor.a = tex2D(BlurMapSampler, uv).a * g_BlurFactor.
+            The ALPHA comes from the BlurMap: if that texture falls back to WHITE, alpha
+            is 1 and the blur covers the screen. That is why the "Blur"/"Mask" fallback
+            has to be BLACK (alpha 0), as it already is.
+
+0x023F9F18  Refraction (water): tex2Dproj(RefractionMapSampler, ...) mixed with the
+            diffuse by g_DiffuseColorWeight, and FinalColor.a fixed at 0.5.
+
+>>> GENERAL PATTERN <<<
+Almost all of these passes depend on ONE screen texture (SceneMap / RefractionMap /
+BlurMap) and on weight floats. When the texture does not resolve or the float arrives as
+0, they do not degrade gracefully: they paint a flat rectangle (white, black, or the
+fallback colour). That is why the "square" symptoms always show up in this family and
+never in ordinary geometry.
+
+>>> AND THEY ALL DECLARE THEIR RENDER STATES IN THE PASS <<<
+   FogEnable = false        (0x023F8288 x5, 0x023F9F18 x4)
+   AlphaBlendEnable = false (0x023F8288 x5)
+This is what fixed the railgun/dagger square, and it is also what keeps fog from being
+applied where the .fx disables it. Reminder for whoever touches the parser: the .fx
+arrives with no line breaks, so the parser has to be scoped to the pass block or it
+chews through the letters (that happened once).
+
+================================================================================
+29. MINIMAPS, CONTAINERS AND THE FONT ATLAS
+================================================================================
+419 entries. The file covers "map" in the broad sense, not just game maps.
+
+--- Minimaps (GUI) ------------------------------------------------------------
+  CCustomGUI_MinimapBase   vtable=01F515F0   (creator 01F518C4)
+  CSimpleMinimap           vtable=01F6711C   (creator 01F673F0)
+  CScoreBoardMinimap       vtable=01F643F4   (creator 01F646C8)
+  CSpectateMinimap         vtable=01F688C0   (creator 01F68B94)
+  ==> The white square that used to show up in the minimap was a draw with no texture
+      on the fixed-function path (fixed, see section 22).
+
+--- Containers -----------------------------------------------------------------
+  CMap<item,common>        vtable=01F6BEB4
+  CClientMap<item,Game>    vtable=01F6BF04
+  CFastMap                 consistency error #0..#4 -> all at 0x01382BA0
+  sp_counted_impl_p<CMapScore<arcade>>  vtable=023DBFBC
+  CMessageMap<ATL>         no vtable (ATL template, never instantiated)
+
+--- Bitmaps and streams --------------------------------------------------------
+  XBitmapFileStream        vtable=01F1B840
+  XBitmapMemoryStream      vtable=01F1B85C
+
+--- FONT ATLAS: the writers  <<< the ones that matter to us >>> ----------------
+  CFont_Bitmap        vtable=023E1894 / 023E1948   (creator 023E1958)
+  CFont_Bitmap_Jp     vtable=01F214A0 / 01F21554
+  CFont_Bitmap_Thai   vtable=01F22DEC / 01F22EA0
+
+  Each has THREE write variants depending on the atlas format, and all three go through
+  [ LockRect ]:
+    CFont_Bitmap::WriteText_A8       01CA5BB0   (and 00F71210)
+    CFont_Bitmap::WriteText_ARGB16   01CA5E30   (and 00F714C0)
+    CFont_Bitmap::WriteText_ARGB32   01CA60C0   (and 00F71780)
+    CFont_Bitmap_Thai::WriteText_A8      00F8D120 / 00F8C8C0
+    CFont_Bitmap_Thai::WriteText_ARGB16  00F8CB70
+    CFont_Bitmap_Thai::WriteText_ARGB32  00F8CE30
+
+  ==> THESE are the functions that lock the atlas glyph by glyph, the path where
+      shadow[0] == 1 showed up and the letters disappeared. A8 is the format used by the
+      512x512 atlas we saw in the log ([font] lock ... fmt=28).
+      If text ever misbehaves again, start at WriteText_A8 01CA5BB0.
+
+--- Technique names of the world shader ---------------------------------------
+The file carries the full list of variants, which confirms the combination matrix of the
+63KB shader:
+  Technique_DiffuseMap[_SpecularMap][_ShadeMap][_LightN][_Rigid|_Skinned]
+Every combination is its own technique. Rigid vs Skinned decides whether the VS applies
+g_matBone; LightN picks how many lights; ShadeMap uses the texture lookup of section 27;
+SpecularMap adds the specular term.
+
+--- 29.b FULL TECHNIQUE MATRIX OF THE WORLD SHADER ----------------------------
+Axes that combine (block 0x0240C0xx..0x0240CCxx):
+  base       DiffuseMap                (always)
+  bump       [_BumpMap]                uses InTangentS
+  static lt  [_LightMap]               BAKED lighting: Final = Dif*(LightMap*2)
+  dynamic lt [_ShadeMap]               texture lookup: uv = 0.5*dot(N,L)+0.5
+  specular   [_SpecularMap]            adds SpecularMapColor * SpePower
+  light count[_Light0 | _Light1]
+  skinning   [_Rigid | _Skinned]       Skinned applies g_matBone[48]
+  quality    [_Low]                    reduced variant
+Example of the extreme: Technique_DiffuseMap_BumpMap_SpecularMap_ShadeMap_Light1_Skinned_Low
+
+  NOTE: LightMap and ShadeMap are DIFFERENT THINGS and both are called "light":
+    LightMap  = per-surface baked texture with its own UVs (Final = Dif * map*2)
+    ShadeMap  = light ramp indexed by the diffuse term (section 27)
+  A wrong fallback in either one flattens the lighting.
+
+--- 29.c FIXED RESOURCES WORTH HAVING LOCATED ---------------------------------
+  0x01F39090  ShadeMapTextureEnemy   <- a bginfo key SEPARATE from the normal
+                                        ShadeMapTexture: there is a different ramp for
+                                        enemies
+  0x01F39A54  Resources/MapInfo/bginfo_3dwaitroom.ini   (the waiting room has its own
+                                        bginfo, with its own fog and light)
+  0x01F6D874  Resources/Effects/SpecMap.dds             (specular map, fixed path)
+  0x0237A944  Resources/XUI/Image/Lobby/Map_select/mission_all.dds
+  Minimap: resources/gui/new/image_minamap_{me,ball,star,red,white,camera,direction}.*
+           and ingame_minimap_{tiara,seize_red,seize_green,seize_gray,seize_alpha,
+           seize_beta}.*
+  (the engine really does spell "minamap" in several of these names, it is not a typo
+  of ours)
+
+================================================================================
+30. THE WORLD SHADER, IN FULL (effect_001.fx, 63KB)
+================================================================================
+
+--- 30.a STRUCTURE: 4 PASSES PER TECHNIQUE, AND THEY ARE VARIANTS --------------
+EVERY technique declares 4 passes with the SAME vertex shader and a different pixel one:
+    p0  <base>
+    p1  <base>_TextureFactor
+    p2  <base>_ContrastSaturation
+    p3  <base>_TextureFactor_ContrastSaturation
+They are NOT layers drawn on top of each other: they are VARIANTS and the engine PICKS
+one. Our log always shows "BeginPass tech=N pass=1", i.e. the TextureFactor one. If all
+4 were ever drawn it would be 4x the overdraw.
+  => Begin() must report the count, but the engine calls BeginPass(k) with the one it
+     wants. Watch for this if things are ever seen running 4x slower.
+
+--- 30.b UNIFORMS AND SAMPLERS ------------------------------------------------
+  int   g_SpecularShiness = 16;      float g_BumpDepth = 0.75;   <- WITH a default
+  float g_Contrast; float g_Saturation;                          <- NO default
+  float3 g_SaturationConst = float3(0.2126, 0.7152, 0.0722);
+  matrices: g_matBone[48], g_matWVP, g_matWorld, g_matViewProj
+  vectors:  g_TexFactor, g_vEyePos, g_vLightPos, g_vLightColor
+  samplers: Diffuse/LightMap/BumpMap/SpecularMap = WRAP
+            ShadeMapSampler = CLAMP    <- the ramp must NOT repeat
+
+--- 30.c THE LIGHT RAMP IS INDEXED BY A SCALAR --------------------------------
+    float4 ShadeColor = tex2D( ShadeMapSampler, In.DifPow );
+In.DifPow is a FLOAT, not a float2. HLSL expands it to float2(DifPow, DifPow): it reads
+the DIAGONAL of the texture. That is why the sampler asks for CLAMP: DifPow can leave
+0..1 and with WRAP the ramp would wrap around.
+    Out.DifPow = 0.5 * dot( tmpNormal, L ) + 0.5      (in the VS)
+With bump, the index comes from the bump in tangent space:
+    ShadeMapUV = g_BumpDepth * dot( BumpMapColor, In.L ) + 0.5
+
+--- 30.d THE THREE LIGHTING FORMULAS ------------------------------------------
+  LightMap  (baked static):    Final = Diffuse * (LightMapColor * 2)
+  Light1    (direct diffuse):  Final = Diffuse * (g_vLightColor * (DifPow+0.5))
+  ShadeMap  (toon ramp):       Final = Diffuse * (g_vLightColor * ShadeColor * 2)
+  Light0    (unlit):           Final = Diffuse
+  + optional specular:         Final += SpecularMapColor * SpePower
+  + optional TextureFactor:    Final *= g_TexFactor   (and alpha *= g_TexFactor.a)
+  In ALL of them: Final.a = DiffuseMapColor.a
+
+  ContrastSaturation (only in p2/p3):
+    Final.rgb = Final.rgb - g_Contrast*(Final.rgb-1)*Final.rgb*(Final.rgb-2);
+    Final.rgb = saturate( lerp( Lum.xxx, Final.rgb, g_Saturation ) );
+  g_Contrast=0 is NEUTRAL, but g_Saturation=0 gives GREY. Since the game is not black
+  and white, either those passes do not run or the engine does send g_Saturation.
+
+--- 30.e VERTEX SHADERS: WHERE EACH THING IS COMPUTED -------------------------
+  Rigid:    tmpPos = mul(InPosition, g_matWorld)
+            tmpNormal = normalize( mul(InNormal, (float3x3)g_matWorld) )
+  Skinned:  tmpPos and tmpNormal accumulate through g_matBone[InBoneIndex.xyzw] weighted
+            by InBoneWeight, then mul(.., g_matViewProj)
+            NOTE: the normal uses mul(float4(InNormal,1), (float3x3)matBone)
+  Bump:     matTBN = float3x3( InTangentS, cross(InTangentS, tmpNormal), tmpNormal )
+            and the light is passed to the PS in tangent space:
+            Out.L = normalize(mul(matTBN, L))
+  Specular: H = normalize(L + V) with V = normalize(g_vEyePos - tmpPos)
+            SpePower = pow( max(dot(tmpNormal, H), 0), g_SpecularShiness )
+  _Low:     the same VS but returning the struct WITHOUT bump (falls back to scalar
+            DifPow)
+
+>>> IMPLICATION FOR THE FLAT LIGHTING PROBLEM <<<
+The chain is: InNormal -> tmpNormal (needs the right g_matWorld or g_matBone) -> DifPow
+-> ShadeMap UV -> colour. If ANY link fails the result is even lighting. Verify in this
+order:
+  1. that g_TexShadeMap resolves (our log says it does NOT: "texture NOT resolved")
+  2. that InNormal reaches the VS (the NORMAL element of the input layout)
+  3. that g_matWorld / g_matBone arrive with the right layout (row-major)
+
+================================================================================
+31. THE bginfo PARSER
+================================================================================
+sub_11948A0  =  reader of the [RENDERER] section of the map's bginfo.
+
+The key names are NOT strings in the binary: they are built character by character with
+sub_11AExxx helpers. That is why a string search does not find them. For example:
+    sub_11AE9B0(&v263, 70,111,103,77,105,110,68,105,115,116)   -> "FogMinDist"
+    sub_11AE7D0(&v286, 70,111,103,67,111,108,111,114,82)       -> "FogColorR"
+    sub_11AED70(&v215, 83,104,97,100,111,119,67,111,108,111,114,82) -> "ShadowColorR"
+    sub_11AEAA0(&v281, 76,105,103,104,116,67,111,108,111,114,82)    -> "LightColorR"
+    sub_11AE500(&v204, 67,117,108,108,68,105,115,116)          -> "CullDist"
+
+Confirmed read order:
+    CullDist
+    FullSceneGlowC / FullSceneGlowO / FullSceneGlowP
+    FogMinDist / FogMaxDist
+    FogColorR / FogColorG / FogColorB
+    ShadowColorR / ShadowColorG / ShadowColorB
+    LightColorR / LightColorG / LightColorB
+    InGameLightPos* / LobbyLightPos*
+    ShadeMapTexture / ShadeMapTextureEnemy   (0x01F39090, referenced at 0x01195B75)
+
+  sub_F26AA0  = looks the key up and returns its value
+  sub_1B39E80 = conversion of the value read
+
+>>> NEW: FullSceneGlowC/O/P are bginfo keys that were not in the .ini we had been
+    looking at. They control the full-screen glow, i.e. the post-process of section 28.
+    If a map carries them and we do not apply them, the glow comes out with the wrong
+    parameters.
+
+>>> AND IT CONFIRMS that ShadeMapTexture is PER-MAP data, read here. The full lighting
+    chain is:
+      bginfo -> sub_11948A0 -> texture load -> g_TexShadeMap of the .fx
+      -> tex2D(ShadeMapSampler, DifPow) -> Final = Dif * (LightColor*Shade*2)
+    Our log says g_TexShadeMap does NOT resolve, so the break is between the load and
+    the bind. The next step is the same one: find out whether the game ever calls
+    SetTexture("g_TexShadeMap").
+
+================================================================================
+32. GROUND TRUTH FROM A CLEAN CLIENT (d3d9spy.dll)
+================================================================================
+A DLL that ONLY watches was written: it hooks the Direct3DCreate9 export of d3d9.dll
+with a 5 byte JMP, patches the device vtable in place and logs. It translates nothing.
+Source: spy/d3d9spy.cpp.
+
+  IMPORTANT: patching the IAT DOES NOT WORK on this exe. The log confirmed it: "NOBODY
+  called Direct3DCreate9 through the IAT". The unpacked dump resolves its imports
+  through wrappers, so the calls never go through the IAT slot. The EXPORT has to be
+  hooked. The prologue is the standard hotpatch one
+  (8B FF 55 8B EC = mov edi,edi; push ebp; mov ebp,esp), so a 5 byte detour plus
+  trampoline is straightforward, with no instruction decoding.
+
+>>> THE SHADEMAP IS A 256x1 RAMP <<<
+    [spy] SetTexture stage=1 tex=... 256x1 fmt=21     (fmt 21 = D3DFMT_A8R8G8B8)
+The original client DOES bind it, through device->SetTexture(1, ...). It is a strip 256
+px wide by 1 tall: the light gradient indexed by tex2D(ShadeMapSampler, DifPow)
+(sections 27 and 30.c).
+
+  ==> THAT IS WHY OUR LIGHTING COMES OUT FLAT. When g_TexShadeMap does not resolve we
+      fall back to 0.5 grey, a CONSTANT value, replacing a gradient with a fixed number:
+      all geometry ends up equally lit.
+      The fix is NOT to change the fallback value (no number produces variation): the
+      texture has to arrive.
+      Stage 1 also carries 256x256 DXT1 textures (fmt 827611204), which are the
+      LightMaps and others; the ShadeMap is recognisable by being 256x1.
+
+>>> FOG: the map DOES change the values <<<
+    RS 35 (FOGTABLEMODE) = 3          -> D3DFOG_LINEAR, per pixel
+    RS 36 (FOGSTART)     = 0x447A0000 -> 1000.0     (default was 0)
+    RS 37 (FOGEND)       = 0x47435000 -> 50000.0    (default was 9984)
+    RS 34 (FOGCOLOR)     = 0xFF123375 -> dark blue  (default was WHITE)
+    RS 28 (FOGENABLE)    toggles 0/1 per object
+  This matches what we had already measured in our own client: reading the state was
+  fine, what failed was the shader wrapper.
+
+>>> DRAW LOAD <<<
+    frame=12961 DIP=7676  -> in lobby/menu the clean client barely draws anything.
+  To compare against our ~160 draws/frame the trace has to be taken INSIDE a match, not
+  in the lobby.
+
+--- 32.b CORRECTION: the VISIBLE fog is the white 0..9984 one -------------------
+There are two fog configurations across the whole trace of the clean client, and the one
+that produces the thick haze seen on the graveyard map is the FIRST one, the one that
+had been dismissed as "the default":
+
+  A (the VISIBLE one):  FOGCOLOR=0xFFFFFFFF white, START=0,    END=9984
+  B (nearly invisible): FOGCOLOR=0xFF123375 blue,  START=1000, END=50000
+
+With A:  d=2000 -> 20% white,  d=5000 -> 50%,  d=9984 -> 100%.
+That is exactly the gradient in the capture: near geometry sharp and the background
+dissolved into white. The lavender tint comes from mixing that white with the blueish
+scene, NOT from a lavender fog colour.
+With B:  d=3000 -> 4% blend. Practically invisible.
+
+  => Fog IS D3DRS_FOG and there is no need to look for it in the post-process.
+     The mechanism to get working is the one in sections 21/26.
+     Careful with assuming "default" means "unused": here it is the other way round.
+
+--- 32.c WHAT THE SPY IS GOOD FOR ---------------------------------------------
+It hooks the export, hooks the device, and logs SetTexture, the fog render states, and
+frame/draw counters. The two hard findings above came out of it: the 256x1 ShadeMap and
+which fog configuration is the visible one.
+
+It is the right tool for closing what is left, because it compares against what the game
+actually DOES rather than against assumptions. Extending it to also log
+SetTextureStageState and the per-stage SetSamplerState would give the exact state of
+every draw.
+
+================================================================================
+33. THE LIGHT RAMPS ARE ON DISK (there was no need to capture them)
+================================================================================
+In the extracted client resources:
+  resources/mapinfo/*.ini   -> one bginfo per map
+  resources/image/*light*   -> the ramps
+
+Every map declares ITS ramp:
+    ShadeMapTexture=Resources/Image/Daytimelight01.tga   (36 maps)
+    ShadeMapTexture=Resources/Image/indoorlight04.tga    (15)
+    ShadeMapTexture=Resources/Image/glowlight01.tga      (15)
+
+And on disk they are 256x1, which confirms what the spy saw live:
+    daytimelight01.dds    256 x 1
+    daytimelight02.dds    256 x 1
+    glowlight01.dds       256 x 1
+    indoorlight03/04.dds  256 x 1
+    indoorlight01.dds     256 x 2
+    indoorlight02.dds     256 x 256   (the exception)
+
+  NOTE: the .ini asks for .TGA and what is on disk is .DDS. The engine substitutes the
+  extension when resolving, exactly like tick2_blue.bmp -> .dds for the wall jump
+  (section 24). If a map texture "does not exist", check that first.
+
+REAL FOG RANGES (counting every bginfo):
+    FogMinDist:  1000 (20 maps), 2000 (15), 10000 (17)
+    FogMaxDist:  15000 (16), 20000 (19), 50000 (14), 100000 (18)
+    FogColor:    varies a lot; FogColorB=1 in 57 maps
+  => The two pairs seen in the trace are not "the default and the map's": they are
+     simply the ones belonging to the two maps that were visited.
+
+  AND THIS IS WHY THE WEAPON EFFECT BUG IS MAP DEPENDENT (section 22.b): every map
+  brings its own fog range, its own colour and its own light ramp, so the same effect
+  draws under a different environment on every map.
+
+Before instrumenting at runtime, LOOK AT THE ASSETS: all of this was readable with a
+grep over mapinfo/.

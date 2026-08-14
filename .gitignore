@@ -1,0 +1,22 @@
+bin/
+obj/
+*.map
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.user
+*.log
+*.bmp
+build.txt
+tools/*.exe
+tools/*.obj
+fx_dump/
+.vs/
+
+# raw string dumps from the client binary, and spy build output
+a reversar.txt
+all map.txt
+text all.txt
+spy/*.obj
+spy/*.dll
