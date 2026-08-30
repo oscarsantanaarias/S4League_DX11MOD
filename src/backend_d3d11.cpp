@@ -468,7 +468,6 @@ static const char* kDefaultHLSL = R"(
 cbuffer C : register(b0) { float4x4 gWorld; float4x4 gView; float4x4 gProj; float vpW; float vpH; float hasTex; float isRHW;
                            float hasCol; float p0; float p1; float p2;
                            float4 stageC[4]; float4 stageA[4]; float4 gTFactor; };
-cbuffer Fog : register(b1) { float4 gFog; float4 gFogColor; };
 Texture2D tex0 : register(t0);
 Texture2D tex1 : register(t1);
 Texture2D tex2 : register(t2);
@@ -547,11 +546,6 @@ float4 PS(VSOut i) : SV_Target {
     if (p0 > 0.0) {
         if (p1 < 0.5) { if (cur.a <  p0) discard; }   // GREATER / GREATEREQUAL
         else          { if (cur.a >= p0) discard; }   // LESS / LESSEQUAL
-    }
-    if (gFog.z > 0.5) {
-        float d = 1.0 / max(i.pos.w, 1e-8);
-        float f = saturate((gFog.y - d) / max(gFog.y - gFog.x, 0.001));
-        cur.rgb = lerp(gFogColor.rgb, cur.rgb, f);
     }
     return cur;
 }
@@ -1366,26 +1360,6 @@ struct NDevice : Unk<IDirect3DDevice9> {
         if (SUCCEEDED(g.ctx->Map(g.cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) { memcpy(m.pData, &cb, sizeof(cb)); g.ctx->Unmap(g.cb, 0); }
         g.ctx->VSSetConstantBuffers(0, 1, &g.cb);
         g.ctx->PSSetConstantBuffers(0, 1, &g.cb);
-        if (g.fogCB) {
-            struct { float fog[4]; float color[4]; } fc{};
-            memcpy(&fc.fog[0], &rs[D3DRS_FOGSTART], 4);
-            memcpy(&fc.fog[1], &rs[D3DRS_FOGEND], 4);
-            float fogStart = fc.fog[0], fogEnd = fc.fog[1];
-            bool mapFog = fogEnd > fogStart && fogEnd > 1.f;
-            bool is2D = (cb.isRHW > 0.5f);
-            fc.fog[2] = (!is2D && (mapFog || rs[D3DRS_FOGENABLE])) ? 1.f : 0.f;
-            DWORD color = rs[D3DRS_FOGCOLOR];
-            fc.color[0] = ((color >> 16) & 0xFF) / 255.f;
-            fc.color[1] = ((color >> 8) & 0xFF) / 255.f;
-            fc.color[2] = (color & 0xFF) / 255.f;
-            fc.color[3] = 1.f;
-            D3D11_MAPPED_SUBRESOURCE fm{};
-            if (SUCCEEDED(g.ctx->Map(g.fogCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &fm))) {
-                memcpy(fm.pData, &fc, sizeof(fc));
-                g.ctx->Unmap(g.fogCB, 0);
-            }
-            g.ctx->PSSetConstantBuffers(1, 1, &g.fogCB);
-        }
         // A draw with texcoords and NO texture comes out as flat color (white if the
         // vertex color is white): that is exactly the shape of the jump square.
         //
