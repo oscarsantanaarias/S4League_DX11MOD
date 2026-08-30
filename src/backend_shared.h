@@ -14,6 +14,10 @@ ID3D11DeviceContext* NE_Ctx();
 ID3D11ShaderResourceView* NE_SRV(IDirect3DBaseTexture9* tex9);
 // SRV of the texture the game set through device->SetTexture(stage) (UI/2D).
 ID3D11ShaderResourceView* NE_DeviceTexSRV(UINT stage);
+// The light ramp (256x1) last bound to stage 1, held with a reference. Used when
+// g_TexShadeMap does not resolve: taking whatever sat on stage 1 at that instant made any
+// effect sprite become the light ramp for a frame, which is the map flicker.
+ID3D11ShaderResourceView* NE_ShadeRampSRV();
 // true if the current blend is additive (DESTBLEND=ONE): there the neutral value is BLACK, not white.
 bool NE_IsAdditive();
 // alpha test threshold (D3DRS_ALPHATESTENABLE/ALPHAREF); 0 = no alpha test.

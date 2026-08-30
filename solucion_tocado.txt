@@ -1,0 +1,75 @@
+SOLUCION TOCADO - cuadro blanco en efectos de arma
+===================================================
+Fecha: 2026-08-30
+
+Archivo cambiado
+----------------
+C:\NativeEngine\src\backend_d3d11.cpp
+
+Cambio 1: estado del target de efecto
+--------------------------------------
+Ubicacion aproximada: linea 289.
+
+Se agrego:
+  g_effectTargetNeedsAlphaClear
+
+Esta bandera indica que se acaba de enlazar un render target offscreen de 256x256.
+Ese tamano corresponde al buffer intermedio usado por los efectos SCN del arma.
+
+Cambio 2: SetRenderTarget
+-------------------------
+Funcion: NDevice::SetRenderTarget
+Ubicacion aproximada: linea 1733.
+
+Cuando el target enlazado mide exactamente 256x256, se arma la bandera. El backbuffer
+normal y cualquier otro tamano no entran en esta ruta.
+
+Cambio 3: primer draw programable
+---------------------------------
+Funcion: NDevice::BeginProgDraw
+Ubicacion aproximada: linea 1899.
+
+Antes del primer draw programable en ese target se ejecuta un clear con:
+  RGB = 1,1,1
+  Alpha = 0
+
+La correccion conserva el color blanco que el cliente prepara, pero elimina su alpha
+opaco. Asi el area vacia del buffer no se compone como un rectangulo blanco cuando la
+camara cambia de altura o angulo.
+
+Por que no rompe la UI
+----------------------
+La UI usa la ruta fixed-function. La correccion solo se ejecuta dentro de
+BeginProgDraw, despues de comprobar que el target es offscreen y mide 256x256.
+No cambia el clear global, el backbuffer ni los estados de la UI.
+
+Cambios retirados
+-----------------
+Se retiraron los intentos anteriores que:
+  - limpiaban el target desde una funcion global condicionada a Technique_FX;
+  - trataban cualquier DiffuseMapSampler de post-efecto como SceneMap.
+
+Esos intentos eran demasiado amplios o no cubrian todos los tecnicas usadas por SCN.
+
+Cadena revisada
+---------------
+weapon_mindshock_hand.seq
+  -> CActNodeLoader
+  -> work\\weapon_mshock_fire.scn
+  -> material haze / alphablend2 / nodepthwrite
+
+La animacion pequena/normal del cuadro pertenece al SEQ y funciona. El error estaba en
+la parte vacia del target intermedio, que conservaba alpha opaco y se componia como
+rectangulo completo.
+
+Salida compilada
+----------------
+Configuracion: Release Win32
+Origen compilado: C:\NativeEngine\src\NativeEngine.vcxproj
+Archivo generado: C:\S4League\dx11.dll
+Archivo preparado para el juego: C:\S4League\dx11.asi
+
+Nota de prueba
+--------------
+En esta pasada no se ejecuto C:\S4League\run.bat. El archivo dx11.asi queda listo para
+probar el mismo angulo/altura donde aparecia el cuadro.

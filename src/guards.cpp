@@ -362,6 +362,17 @@ void InstallRenderTargetStackGuard() {
     // The prologue is exactly 5 bytes (push ebp; mov ebp,esp; push -1), so the
     // trampoline does not split any instruction.
     BYTE* target = (BYTE*)S4(0x01CAE900);
+    // Verify the prologue like every other patch does. This was the ONE hook writing its
+    // JMP blind, and it also copies 5 bytes into a trampoline: on a client whose prologue
+    // differs those 5 bytes cut an instruction in half, so the trampoline returns into the
+    // middle of one and the CPU runs garbage -- which is exactly what an EIP outside .text
+    // at startup looks like. Skipping the hook is always better than corrupting code.
+    static const BYTE kExpect[5] = { 0x55, 0x8B, 0xEC, 0x6A, 0xFF }; // push ebp; mov ebp,esp; push -1
+    if (memcmp(target, kExpect, 5) != 0) {
+        Log("[ne] RenderTargetStackGuard NOT installed at %p: holds %02X %02X %02X %02X %02X\n",
+            target, target[0], target[1], target[2], target[3], target[4]);
+        return;
+    }
     DWORD old;
     if (!VirtualProtect(target, 16, PAGE_EXECUTE_READWRITE, &old)) return;
     memcpy(g_frontTramp, target, 5);
@@ -373,7 +384,7 @@ void InstallRenderTargetStackGuard() {
     *(int*)(target + 1) = (int)((intptr_t)&Safe_DequeFront - ((intptr_t)target + 5));
     VirtualProtect(target, 16, old, &old);
     FlushInstructionCache(GetCurrentProcess(), target, 16);
-    Log("[ne] RenderTargetStackGuard installed at 01CAE900\n");
+    Log("[ne] RenderTargetStackGuard installed at %p\n", target);
 }
 
 // FUN_00e98d00: destroys one element of a pool and frees it.
@@ -444,6 +455,15 @@ void InstallContainerGuard() {
 
 void InstallStringIterGuard() {
     BYTE* target = (BYTE*)S4(0x011BB0F0);
+    // Same reasoning as the render target guard: verify before writing. This one replaces
+    // the function outright (no trampoline), but a wrong address still means a JMP landing
+    // in the middle of unrelated code.
+    static const BYTE kExpect[3] = { 0x55, 0x8B, 0xEC };   // push ebp; mov ebp,esp
+    if (memcmp(target, kExpect, 3) != 0) {
+        Log("[ne] StringIterGuard NOT installed at %p: holds %02X %02X %02X\n",
+            target, target[0], target[1], target[2]);
+        return;
+    }
     DWORD old;
     if (!VirtualProtect(target, 5, PAGE_EXECUTE_READWRITE, &old)) return;
     // JMP rel32 to our version
@@ -453,6 +473,58 @@ void InstallStringIterGuard() {
     VirtualProtect(target, 5, old, &old);
     FlushInstructionCache(GetCurrentProcess(), target, 5);
     Log("[ne] StringIterGuard installed at %p\n", target);
+}
+
+// The client's own lock wrapper (0x026A0430) reads:
+//
+//     if (*obj != 0x03FAF713)                       // "is this object initialised?"
+//         Log(L"Cannot enter critical section wh..."); // <-- it only LOGS
+//     EnterCriticalSection((LPCRITICAL_SECTION)(obj + 1));  // <-- and enters anyway
+//
+// So when the object has not been initialised it walks into an uninitialised
+// CRITICAL_SECTION, and ntdll faults dereferencing its DebugInfo -- which is why the
+// crash report shows an address in ntdll's own range (0x77C50E7C) three milliseconds
+// into startup. The memory is uninitialised heap, so whether it crashes depends on what
+// happened to be there: it runs for hours, then does not, and it differs between
+// machines. The client already knows how to detect this; it just does not act on it.
+// We complete the check: no magic -> do not enter. Leave has to match, or we would
+// release a section we never took.
+static const int kObjMagic = 0x03FAF713;
+static LONG g_csSkipped = 0;
+static void __fastcall Safe_EnterCS(int* obj, void*) {
+    if (NE_LOW(obj)) return;
+    __try { if (*obj != kObjMagic) { InterlockedIncrement(&g_csSkipped); return; } }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return; }
+    EnterCriticalSection((LPCRITICAL_SECTION)(obj + 1));
+}
+static void __fastcall Safe_LeaveCS(int* obj, void*) {
+    if (NE_LOW(obj)) return;
+    __try { if (*obj != kObjMagic) return; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return; }
+    LeaveCriticalSection((LPCRITICAL_SECTION)(obj + 1));
+}
+LONG CriticalSectionsSkipped() { return g_csSkipped; }
+void InstallCriticalSectionGuard() {
+    // cmp dword ptr [ecx], 3FAF713h -- the magic test that opens both functions
+    static const BYTE kCmp[6] = { 0x81, 0x39, 0x13, 0xF7, 0xFA, 0x03 };
+    struct { uintptr_t va; void* fn; const char* name; } k[] = {
+        { S4(0x026A0430), (void*)&Safe_EnterCS, "EnterCS" },
+        { S4(0x026A0460), (void*)&Safe_LeaveCS, "LeaveCS" },
+    };
+    for (auto& e : k) {
+        BYTE* p = (BYTE*)e.va;
+        if (memcmp(p, kCmp, sizeof(kCmp)) != 0) {
+            Log("[ne] CriticalSectionGuard/%s NOT installed at %p: holds %02X %02X %02X %02X %02X %02X\n",
+                e.name, p, p[0], p[1], p[2], p[3], p[4], p[5]);
+            continue;
+        }
+        DWORD old;
+        if (!VirtualProtect(p, 5, PAGE_EXECUTE_READWRITE, &old)) continue;
+        p[0] = 0xE9; *(int*)(p + 1) = (int)((BYTE*)e.fn - (p + 5));
+        VirtualProtect(p, 5, old, &old);
+        FlushInstructionCache(GetCurrentProcess(), p, 5);
+        Log("[ne] CriticalSectionGuard/%s installed at %p\n", e.name, p);
+    }
 }
 
 } // namespace ne

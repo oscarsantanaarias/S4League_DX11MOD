@@ -8,7 +8,7 @@
 #include "log.h"
 #include "s4_base.h"
 
-namespace ne { void InstallStringIterGuard(); void InstallBackHook(); void InstallFontLockCrashFix(); void InstallHashIndexGuards(); void InstallFontMemsetGuard(); void InstallContainerGuard(); void InstallMatrixCopyGuard(); void InstallSafeMemcpyS(); void InstallComAssignGuard(); void InstallRenderTargetStackGuard(); void InstallPoolDestroyGuard(); }
+namespace ne { void ApplyImportTable(bool noLoadLibrary); void HarvestImports(); void InstallStringIterGuard(); void InstallBackHook(); void InstallFontLockCrashFix(); void InstallHashIndexGuards(); void InstallFontMemsetGuard(); void InstallContainerGuard(); void InstallMatrixCopyGuard(); void InstallSafeMemcpyS(); void InstallComAssignGuard(); void InstallRenderTargetStackGuard(); void InstallPoolDestroyGuard(); void InstallCriticalSectionGuard(); }
 
 // diagnostics: log where it crashes (module + offset + backtrace)
 static void ModOf(void* addr, char* out, void** base) {
@@ -72,8 +72,23 @@ static void InstallMemoryJumpFix() {
     ne::Log("[ne] MemoryJumpFix applied at %p\n", site);
 }
 
+// The packer's stubs fill their tables lazily, long after startup, so one sweep during init
+// only sees the ordinary IAT. Sweep again as the client reaches the menu and the lobby; each
+// pass merges into the same map, so whatever appears late still gets recorded.
+static DWORD WINAPI HarvestThread(LPVOID) {
+    static const DWORD kAt[] = { 5000, 20000, 45000, 90000, 180000 };
+    DWORD prev = 0;
+    for (DWORD t : kAt) { Sleep(t - prev); prev = t; ne::HarvestImports(); }
+    return 0;
+}
+
 static DWORD WINAPI InitThread(LPVOID) {
     ne::Log("[ne] NativeEngine init\n");
+    // Second pass, now that a thread is running and LoadLibrary is safe: the DllMain pass
+    // could only use modules that were already loaded.
+    ne::ApplyImportTable(false);
+    { char e[8] = ""; if (GetEnvironmentVariableA("NE_HARVEST_IMPORTS", e, sizeof(e)) && e[0] == '1')
+        CreateThread(nullptr, 0, HarvestThread, nullptr, 0, nullptr); }
     InstallMemoryJumpFix();
     ne::InstallStringIterGuard();
     ne::InstallFontLockCrashFix();
@@ -85,6 +100,11 @@ static DWORD WINAPI InitThread(LPVOID) {
     ne::InstallComAssignGuard();
     ne::InstallRenderTargetStackGuard();
     ne::InstallPoolDestroyGuard();
+    // The client enters critical sections it knows are uninitialised (it logs
+    // "Cannot enter critical section" and proceeds). That is the startup crash whose
+    // faulting address lands inside ntdll; it is heap-luck dependent, so it comes and
+    // goes between runs and machines.
+    ne::InstallCriticalSectionGuard();
     // ne::InstallBackHook();  // the 5-byte trampoline split an instruction -> crash on startup
     AddVectoredExceptionHandler(1, Veh);
     AddVectoredContinueHandler(1, Veh);   // a 0xC0000409 fastfail does not always go through the normal VEH
@@ -104,6 +124,13 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
        // LoadLibraryA("fixes.dll");
        //LoadLibraryA("crash_catch.dll"); // optional: the user's crash dll (if present)
         DisableThreadLibraryCalls(hModule);
+        // Synchronously, before returning to the loader: this dump has an IAT slot that
+        // Windows never fills (Scylla merged three user32 descriptors into one contiguous
+        // run and put wsprintfA in a gap slot, so the slot the code calls through keeps the
+        // dead address baked at dump time). The client can fault on it before a freshly
+        // created thread ever gets scheduled, which is why InitThread was too late.
+        // Loader lock is held here, so this pass resolves only already-loaded modules.
+        ne::ApplyImportTable(true);
         CreateThread(nullptr, 0, InitThread, nullptr, 0, nullptr);
     }
     return TRUE;

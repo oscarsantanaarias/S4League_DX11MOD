@@ -969,11 +969,12 @@ The white square on the basic (non-skin) Mind Shock / Mind Heal and on the railg
 charge is NOT constant across maps. On Station 2 the railgun charge renders correctly
 (radial arc gauge plus glow); on other maps the very same weapon gives the white square.
 
-Maps where the effects render CORRECTLY, confirmed in game so far:
+Maps where the effects FAIL (white square), confirmed in game so far:
     Station 1, Station 2, Wonderland, Ice Square, Neden 3
 There are more; they simply have not been verified yet. That is the list of what has
-actually been seen working, not the complete set. Diffing the bginfo [RENDERER] block of
-these against a map where it fails is the cheapest next step.
+actually been seen failing, not the complete set. On other maps the same weapon renders
+correctly. Diffing the bginfo [RENDERER] block of these against a map where it works is
+the cheapest next step.
 
 That rules the weapon out: the effect is the same asset either way. What changes between
 maps is the environment the effect samples from, which is exactly what this section is
@@ -986,6 +987,94 @@ about:
 So the thing to compare is not two weapons, it is two maps: on a map where it works
 against a map where it does not, which SRV lands on the scene sampler and which render
 states the surrounding passes left behind.
+
+================================================================================
+22.c WHY IT IS MAP DEPENDENT: THE SCENE TEXTURE IS ONLY REFRESHED BY THE
+     GLOW / HAZE / FULLSCENE PASSES, AND THOSE ARE PER MAP
+================================================================================
+Reversed in IDA. The chain, end to end:
+
+--- The shader dispatcher -----------------------------------------------------
+CShaderMgr_CreateShaderByType  0x01CB6DD0   switch on a shader type id:
+    1 Shader (world, VS20PS20 -> VS11PS11 -> VS11 fallback chain)
+    2 Glow            3 FullSceneGlow      4 FullSceneBlur
+    5 Haze            6 Haze2              7 Refraction   <<< the weapon effects
+    8 Water (gated by two capability checks)              9 Effect_VS11
+CShaderMgr_GetOrCreateShader 0x01CE7880 caches them in renderer+8+type*4.
+CGame_PreloadShaders 0x01321500 preloads 1,3,4,6,7,8,9 -- NOT 2 (Glow) and NOT
+5 (Haze): those two are created lazily, the first time a map actually needs them.
+
+--- An effect opts into the scene texture BY NAME ------------------------------
+CNodeLoader_ApplyFullSceneRT_A 0x01264900 (and _B 0x01264F80) do a substring
+search for the literal "fullscenerendertarget" (0x01F3E848 / 0x01F3E904) in the
+node's name string, exactly like the render state tokens of section 24. If the
+name carries it, CNodeLoader_MarkFullSceneRTChildren 0x01264E30 walks the node's
+children and flags every one of the matching class.
+  ==> Whether an effect needs the scene texture is data, written into the .scn
+      node name. It is not a property of the shader.
+
+--- But the texture is only refreshed inside the glow/haze passes -------------
+CRenderer_D3D_UpdateScreenTexture  0x01C84680  = CRenderer_D3D vtable +0x88
+CRenderer_D3D_GetScreenTexture     0x01C822C0  = the next slot, +0x8C
+CRenderer_UpdateScreenTextureIfAny 0x01CE7A60  = if (renderer+0x30) call its +0x2C
+
+CRenderScene_RenderGlowPass 0x01CE2E70 (type 2) and CRenderScene_RenderHazePass
+0x01CE31C0 (type 5) have the same shape, and they call
+CRenderer_UpdateScreenTextureIfAny twice around EVERY object they draw. Both open
+with the same guard:
+
+    if (list_at(renderer + 0x194) is empty || list_at(renderer + 0x198) is empty
+        || global_toggle() == 0)  return;         // glow
+    if (list_at(renderer + 0x19C) is empty || list_at(renderer + 0x1A0) is empty
+        || global_toggle() == 0)  return;         // haze
+
+>>> THAT IS THE WHOLE BUG. A map with no glow and no haze geometry has those
+    lists empty, both passes return immediately, and NOTHING calls
+    UpdateScreenTexture that frame. The scene texture is then never refreshed.
+    The refraction shader of section 22 paints nothing but that texture, so on
+    such a map it samples a stale or never-filled surface. Our backend, which
+    remembers the SRV from the StretchRect into the 512x512 target, has nothing
+    to hand it and falls back to white -> the opaque white square.
+
+    It matches the evidence: the maps where the effects render correctly
+    (Station 1, Station 2, Wonderland, Ice Square, Neden 3) are all heavy on
+    glowing neon geometry, i.e. exactly the maps whose glow list is not empty.
+
+--- And the fullscene blur weights are per-map too ------------------------------
+CBgInfo_ParseRendererSection 0x011948A0 reads, in this order, into the map's
+render settings object:
+    CullDist                    -> +0x6C
+    FullSceneGlowColorRev       -> +0x70
+    FullSceneGlowOrgColorRev    -> +0x74
+    FullSceneGlowPeriColorRev   -> +0x78
+    FogMinDist                  -> +0x64
+    FogMaxDist                  -> +0x68
+    FogColorR/G/B, ShadowColor*, LightColor*, light positions, ShadeMapTexture
+
+CMapRenderSettings_Apply 0x011A2A10 then publishes the three glow weights to
+globals when the map loads:
+    g_FullSceneGlowColorRev      0x0256F790
+    g_FullSceneGlowOrgColorRev   0x0256F794
+    g_FullSceneGlowPeriColorRev  0x0256F798
+
+and CFullSceneBlurShader_Init 0x01CBD8D0 / _BindSceneTexture 0x01CBDA00 feed them
+to the shader as g_fColorRev / g_fOrgColorRev / g_fPeriColorRev -- the exact three
+floats of section 28 that turn the blur black when they arrive as zero.
+_BindSceneTexture also binds renderer->GetScreenTexture() (+0x8C) as the blur's
+g_TexDiffuseMap, which confirms the blur and the weapon effects sample the SAME
+512x512 surface.
+
+--- DIAGNOSTIC IN PLACE -------------------------------------------------------
+The backend logs a [map] line: the three glow weights (in thousandths, since Log()
+has no %f) and how many times the scene texture was refreshed per 120 frames. It
+reads the globals directly, so it needs no hook and cannot crash the client. A map
+where the effects fail should print sceneTexUpdates=0.
+
+--- FIX, once the log confirms it ---------------------------------------------
+Do not chase the engine into calling UpdateScreenTexture: it is right not to, the
+map has nothing that needs it. Refresh the scene texture ourselves when something
+is about to sample it and it is stale -- we already see the StretchRect, and we
+already know which samplers are Scene/Screen/Refraction.
 
 ================================================================================
 23. PERFORMANCE: WHAT WAS FOUND AND WHAT IS LEFT

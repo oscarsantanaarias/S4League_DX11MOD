@@ -14,6 +14,7 @@
 #include <windows.h>
 #include <d3d9.h>
 #include <d3d11.h>
+#include <d3d11_1.h>   // ID3D11DeviceContext1::ClearView, for D3D9 rectangle clears
 #include <d3d11sdklayers.h>
 #include <d3dcompiler.h>
 #undef GetMessage
@@ -22,6 +23,7 @@
 #include <vector>
 #include "iat.h"
 #include "log.h"
+#include "s4_base.h"
 #include "backend_shared.h"
 
 #pragma comment(lib, "d3d11.lib")
@@ -53,6 +55,9 @@ static IDirect3DDevice9* g_dev9 = nullptr;
 struct NE_RTView { ID3D11RenderTargetView* rtv = nullptr; ID3D11DepthStencilView* dsv = nullptr; UINT w = 0, h = 0; ID3D11Texture2D* tex = nullptr; UINT sub = 0; };
 struct NTexture;
 static void NE_TexLevelFilled(NTexture* t, UINT lvl); // defined after NTexture
+// The light ramp last seen on stage 1 (see SetTexture). Referenced, so it survives the
+// texture being destroyed on a map change.
+static ID3D11ShaderResourceView* g_rampSRV = nullptr;
 static const GUID IID_NE_RTView = { 0x9e0a1b2c, 0x3d4e, 0x5f60, { 0x71,0x82,0x93,0xa4,0xb5,0xc6,0xd7,0xe8 } };
 static NE_RTView* NE_QueryRT(IDirect3DSurface9* s) { if (!s) return nullptr; NE_RTView* v = nullptr; return SUCCEEDED(s->QueryInterface(IID_NE_RTView, (void**)&v)) ? v : nullptr; }
 
@@ -278,9 +283,34 @@ struct Program { ID3D11VertexShader* vs = nullptr; ID3D11PixelShader* ps = nullp
 // diagnostic counters
 static ID3D11Texture2D* g_sceneTex = nullptr;
 static ID3D11ShaderResourceView* g_sceneSRV = nullptr;
+// SCN weapon effects render into a 256x256 target that the client clears white.
+// The UI uses the same size through the fixed-function path, so only the first
+// programmable draw after binding that target may neutralize the clear alpha.
+static bool g_effectTargetNeedsAlphaClear = false;
 static LONG dbg_IUP = 0;
 // draws the game asked for and we did NOT execute, by reason
 static LONG dbg_skipVS = 0, dbg_skipFVF = 0, dbg_skipBuf = 0, dbg_skipProg = 0;
+// The per-map FullSceneGlow weights, in thousandths. CBgInfo_ParseRendererSection
+// (0x011948A0) reads FullSceneGlow{,Org,Peri}ColorRev out of the map's bginfo and
+// CMapRenderSettings_Apply (0x011A2A10) publishes them to these globals on map load.
+// Out of line because Present holds objects with destructors and MSVC will not accept
+// __try in a function that needs unwinding.
+// ClearView (rectangle clears) lives on ID3D11DeviceContext1. Queried once and cached;
+// null on a runtime that does not have it, in which case Clear falls back to wiping the
+// whole target as before.
+static ID3D11DeviceContext1* Ctx1() {
+    static ID3D11DeviceContext1* c1 = nullptr;
+    static bool tried = false;
+    if (!tried) { tried = true; if (g.ctx) g.ctx->QueryInterface(__uuidof(ID3D11DeviceContext1), (void**)&c1); }
+    return c1;
+}
+
+static void ReadGlowWeights(int out[3]) {
+    const float* g = (const float*)S4(0x0256F790);
+    __try { for (int i = 0; i < 3; ++i) out[i] = (int)(g[i] * 1000.0f); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { out[0] = -1; out[1] = -1; out[2] = -1; }
+}
+
 static LONG dbg_DIP = 0, dbg_DP = 0, dbg_UP = 0, dbg_progActive = 0, dbg_progOK = 0, dbg_noStream = 0, dbg_noDecl = 0, dbg_noIL = 0, dbg_Clear = 0, dbg_SetRT = 0, dbg_texUnlock = 0, dbg_updateTex = 0, dbg_fvfDrew = 0, dbg_fvfSkip = 0, dbg_sceneCopy = 0;
 // Measurement: how much of the frame goes INSIDE our backend vs the rest (the game).
 static LONGLONG t_inBackend = 0, t_lastPresent = 0, t_frameTotal = 0;
@@ -327,8 +357,22 @@ static D3D11_BLEND MapBlend(DWORD b) {
         case 11: return D3D11_BLEND_SRC_ALPHA_SAT; default: return D3D11_BLEND_ONE;
     }
 }
-struct BlendCache { DWORD s, d; ID3D11BlendState* bs; };
-static BlendCache g_blendCache[64]; static int g_blendCount = 0;
+struct BlendCache { DWORD s, d, op; ID3D11BlendState* bs; };
+static BlendCache g_blendCache[256]; static int g_blendCount = 0;
+// D3DRS_BLENDOP (171). It was pinned to ADD, so every blend the game asked to SUBTRACT,
+// REVSUBTRACT, MIN or MAX was added instead. That is what turned the weapon charge glow
+// into a white block: the game renders it into a 256x256 buffer it clears to WHITE and
+// composites that buffer with a non-additive op, where white is a no-op. Forced to ADD,
+// white plus the scene saturates and you get an opaque square.
+static D3D11_BLEND_OP MapBlendOp(DWORD o) {
+    switch (o) {
+        case 2:  return D3D11_BLEND_OP_SUBTRACT;      // D3DBLENDOP_SUBTRACT
+        case 3:  return D3D11_BLEND_OP_REV_SUBTRACT;  // D3DBLENDOP_REVSUBTRACT
+        case 4:  return D3D11_BLEND_OP_MIN;           // D3DBLENDOP_MIN
+        case 5:  return D3D11_BLEND_OP_MAX;           // D3DBLENDOP_MAX
+        default: return D3D11_BLEND_OP_ADD;           // D3DBLENDOP_ADD (1) and unset
+    }
+}
 // D3D11 does not accept COLOR factors on the alpha channel: they are translated to the equivalent.
 static D3D11_BLEND MapBlendAlpha(DWORD b) {
     D3D11_BLEND x = MapBlend(b);
@@ -340,20 +384,32 @@ static D3D11_BLEND MapBlendAlpha(DWORD b) {
         default: return x;
     }
 }
-static ID3D11BlendState* GetBlend(DWORD s, DWORD d) {
-    if (!s) s = 5; if (!d) d = 6;
+static ID3D11BlendState* GetBlend(DWORD s, DWORD d, DWORD op = 1) {
+    if (!s) s = 5; if (!d) d = 6; if (!op) op = 1;
     CtxLock lk; // cache shared between threads
-    for (int i = 0; i < g_blendCount; ++i) if (g_blendCache[i].s == s && g_blendCache[i].d == d) return g_blendCache[i].bs;
+    for (int i = 0; i < g_blendCount; ++i)
+        if (g_blendCache[i].s == s && g_blendCache[i].d == d && g_blendCache[i].op == op) return g_blendCache[i].bs;
+    // NEVER create an uncacheable state: this used to fall through and build a fresh
+    // ID3D11BlendState on every draw, leaking one per draw with nothing releasing them.
+    // It was unreachable while the key was just (src,dst) -- adding the blend op multiplied
+    // the combinations, the table filled, and memory climbed to 3.5GB in seconds.
+    if (g_blendCount >= (int)(sizeof(g_blendCache) / sizeof(g_blendCache[0]))) {
+        static LONG once = 0;
+        if (InterlockedIncrement(&once) == 1) Log("[ne] blend cache full (%d): reusing\n", g_blendCount);
+        for (int i = 0; i < g_blendCount; ++i)
+            if (g_blendCache[i].s == s && g_blendCache[i].d == d) return g_blendCache[i].bs;
+        return g_blendCache[0].bs;
+    }
     D3D11_BLEND_DESC bd{}; bd.RenderTarget[0].BlendEnable = TRUE;
-    bd.RenderTarget[0].SrcBlend = MapBlend(s); bd.RenderTarget[0].DestBlend = MapBlend(d); bd.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+    bd.RenderTarget[0].SrcBlend = MapBlend(s); bd.RenderTarget[0].DestBlend = MapBlend(d); bd.RenderTarget[0].BlendOp = MapBlendOp(op);
     // D3D9 WITHOUT D3DRS_SEPARATEALPHABLENDENABLE (the game never turns it on) blends
     // alpha with the SAME factors as color. It was pinned to ONE/INV_SRC_ALPHA: on the
     // additive effects (alphablend2 material) the color added up fine but the alpha
     // came out of a different formula and the quad ended up with a wrong alpha.
-    bd.RenderTarget[0].SrcBlendAlpha = MapBlendAlpha(s); bd.RenderTarget[0].DestBlendAlpha = MapBlendAlpha(d); bd.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+    bd.RenderTarget[0].SrcBlendAlpha = MapBlendAlpha(s); bd.RenderTarget[0].DestBlendAlpha = MapBlendAlpha(d); bd.RenderTarget[0].BlendOpAlpha = MapBlendOp(op);
     bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
     ID3D11BlendState* bs = nullptr; if (g.dev) g.dev->CreateBlendState(&bd, &bs);
-    if (g_blendCount < 64) g_blendCache[g_blendCount++] = { s, d, bs };
+    g_blendCache[g_blendCount++] = { s, d, op, bs };
     return bs;
 }
 
@@ -684,6 +740,7 @@ struct NSurface : Unk<IDirect3DSurface9> {
     STDMETHOD(GetDC)(HDC* p) { *p = nullptr; return D3D_OK; }
     STDMETHOD(ReleaseDC)(HDC) { return D3D_OK; }
 };
+static void SafeUpdateSubresource(ID3D11Texture2D* t, UINT lvl, const void* src, UINT pitch, UINT size);
 // surface of a texture level: on Unlock it uploads the data to the D3D11 texture
 struct NTexSurface : Unk<IDirect3DSurface9> {
     // we keep them cached and the game sometimes over-Releases -> if one is deleted,
@@ -716,14 +773,17 @@ struct NTexSurface : Unk<IDirect3DSurface9> {
         NE_TexLevelFilled(owner, level); // D3DX fills the mips per surface, not per texture
         if (!tex || !data) return D3D_OK;
         CtxLock lk;
-        if (conv == 0) { g.ctx->UpdateSubresource(tex, level, nullptr, data, rowPitch, levelSize); return D3D_OK; }
+        // through SafeUpdateSubresource like every other upload: this is the path the client
+        // really uses (GetSurfaceLevel -> LockRect -> UnlockRect), and it was bypassing both
+        // the crash guard and the diagnostics.
+        if (conv == 0) { SafeUpdateSubresource(tex, level, data, rowPitch, levelSize); return D3D_OK; }
         std::vector<BYTE> bgra((size_t)w * h * 4);
         for (UINT i = 0; i < w * h; ++i) {
             if (conv == 4) { bgra[i * 4] = data[i * 4]; bgra[i * 4 + 1] = data[i * 4 + 1]; bgra[i * 4 + 2] = data[i * 4 + 2]; bgra[i * 4 + 3] = 255; }
             else if (conv == 3) { bgra[i * 4] = data[i * 3]; bgra[i * 4 + 1] = data[i * 3 + 1]; bgra[i * 4 + 2] = data[i * 3 + 2]; bgra[i * 4 + 3] = 255; }
             else { BYTE L, A; if (conv == 1) { L = data[i]; A = 255; } else { L = data[i * 2]; A = data[i * 2 + 1]; } bgra[i * 4] = L; bgra[i * 4 + 1] = L; bgra[i * 4 + 2] = L; bgra[i * 4 + 3] = A; }
         }
-        g.ctx->UpdateSubresource(tex, level, nullptr, bgra.data(), w * 4, w * 4 * h);
+        SafeUpdateSubresource(tex, level, bgra.data(), w * 4, w * 4 * h);
         return D3D_OK;
     }
     STDMETHOD(GetDC)(HDC* p) { *p = nullptr; return D3D_OK; }
@@ -795,6 +855,34 @@ static void SafeUpdateSubresource(ID3D11Texture2D* t, UINT lvl, const void* src,
         static LONG n = 0; if (InterlockedIncrement(&n) <= 8)
             Log("[ne] UpdateSubresource SKIPPED tex=%p lvl=%u src=%p pitch=%u size=%u\n", t, lvl, src, pitch, size);
         return;
+    }
+    // A texture we upload as ALL WHITE or ALL ZERO is almost always a load that produced
+    // nothing: the surface was created at the right size but never filled with real
+    // pixels. That is what the weapon charge effect's 128x128 source texture turned out
+    // to be in the RenderDoc capture -- blank white, ShaderRead only, its single write a
+    // CPU upload. Sampling a few bytes is cheap (a few hundred uploads per session) and
+    // it names the texture instead of leaving it to be found frame by frame.
+    if (lvl == 0 && size >= 64) {
+        __try {
+            // Scan EVERY byte with an early exit. Sampling 16 spread-out points looked cheap
+            // and was useless: unrelated textures matched at those offsets and got reported
+            // as blank, so the first pass produced a list of false positives.
+            const BYTE* b = (const BYTE*)src;
+            BYTE first = b[0]; bool uniform = true;
+            for (UINT i = 1; i < size; ++i) if (b[i] != first) { uniform = false; break; }
+            // Only genuinely uniform uploads are worth a line, and one per distinct texture:
+            // the font atlas alone is uploaded blank hundreds of times.
+            if (uniform) {
+                static ID3D11Texture2D* seen[64]; static LONG nseen = 0;
+                bool dup = false;
+                for (LONG i = 0; i < nseen && i < 64; ++i) if (seen[i] == t) { dup = true; break; }
+                if (!dup && nseen < 64) {
+                    seen[nseen++] = t;
+                    Log("[tex] VACIA 0x%02X tex=%p pitch=%u size=%u (%ux%u si es BGRA)\n",
+                        first, t, pitch, size, pitch / 4, pitch ? size / pitch : 0);
+                }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
     }
     __try { g.ctx->UpdateSubresource(t, lvl, nullptr, src, pitch, size); }
     __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -1235,13 +1323,21 @@ struct NDevice : Unk<IDirect3DDevice9> {
         g.ctx->VSSetShader(g.vsDefault, nullptr, 0);
         g.ctx->PSSetShader(g.psDefault, nullptr, 0);
         float bf[4] = { 0,0,0,0 };
-        if (rs[D3DRS_ALPHABLENDENABLE]) g.ctx->OMSetBlendState(GetBlend(rs[D3DRS_SRCBLEND], rs[D3DRS_DESTBLEND]), bf, 0xffffffff);
+        if (rs[D3DRS_ALPHABLENDENABLE]) g.ctx->OMSetBlendState(GetBlend(rs[D3DRS_SRCBLEND], rs[D3DRS_DESTBLEND], rs[D3DRS_BLENDOP]), bf, 0xffffffff);
         else g.ctx->OMSetBlendState(nullptr, bf, 0xffffffff);
         g.ctx->PSSetSamplers(0, 1, &g.samp);
         // "White" TEST: if forcing opaque makes it disappear, there is an ADDITIVE pass on top.
         CBData cb{};
         memcpy(cb.world, &mWorld, 64); memcpy(cb.view, &mView, 64); memcpy(cb.proj, &mProj, 64);
-        cb.vpW = (float)g.bbW; cb.vpH = (float)g.bbH; cb.hasTex = tex[0] ? (tex[0]->isA8 ? 2.f : 1.f) : 0.f;
+        // XYZRHW coords are VIEWPORT-relative. On the BACKBUFFER the UI relies on the
+        // full screen size (curVP can be left stale from an offscreen pass, so trusting
+        // it there breaks the UI). Only when rendering into an OFFSCREEN target (the
+        // 256x256 weapon-glow buffer) does the backbuffer size mis-map the RHW quad into
+        // a corner and leave the white clear -> the white square. Viewport-based vpW
+        // broke the UI (curVP goes stale on offscreen->backbuffer), so left as-is; the
+        // real fix is on the program path, not here. See QUEUE.md #1.
+        cb.vpW = (float)g.bbW; cb.vpH = (float)g.bbH;
+        cb.hasTex = tex[0] ? (tex[0]->isA8 ? 2.f : 1.f) : 0.f;
         cb.isRHW = ((fvf & D3DFVF_POSITION_MASK) == D3DFVF_XYZRHW) ? 1.f : 0.f;
         cb.hasCol = (fvf & D3DFVF_DIFFUSE) ? 1.f : 0.f;
         for (int s = 0; s < 4; ++s) {
@@ -1325,15 +1421,49 @@ struct NDevice : Unk<IDirect3DDevice9> {
     STDMETHOD(TestCooperativeLevel)() { return D3D_OK; }
     STDMETHOD(BeginScene)() { return D3D_OK; }
     STDMETHOD(EndScene)() { return D3D_OK; }
-    STDMETHOD(Clear)(DWORD, const D3DRECT*, DWORD flags, D3DCOLOR c, float z, DWORD stencil) {
+    STDMETHOD(Clear)(DWORD count, const D3DRECT* rects, DWORD flags, D3DCOLOR c, float z, DWORD stencil) {
         InterlockedIncrement(&dbg_Clear);
-        if (g.ctx && g.rtv && (flags & D3DCLEAR_TARGET)) {
-            float col[4] = { ((c >> 16) & 0xFF) / 255.f, ((c >> 8) & 0xFF) / 255.f, (c & 0xFF) / 255.f, ((c >> 24) & 0xFF) / 255.f };
-            g.ctx->ClearRenderTargetView(g.curRTV ? g.curRTV : g.rtv, col);
+        ID3D11RenderTargetView* rt = g.curRTV ? g.curRTV : g.rtv;
+        // What the GAME actually asks for, per distinct target size. Everything measured so
+        // far was read off our own D3D11 call in the capture, which cannot tell an argument
+        // we decoded wrong from one the game really passed.
+        if (rt && rt != g.rtv) {
+            static LONG n = 0;
+            if (InterlockedIncrement(&n) <= 10)
+                Log("[clr] target OFFSCREEN vp=%ux%u flags=0x%X color=0x%08X (a=%u r=%u g=%u b=%u) rects=%u\n",
+                    curVP.Width, curVP.Height, flags, c,
+                    (c >> 24) & 0xFF, (c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF, count);
         }
-        if (g.ctx && g.dsv && (flags & (D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL))) {
+        if (g.ctx && rt && (flags & D3DCLEAR_TARGET)) {
+            float col[4] = { ((c >> 16) & 0xFF) / 255.f, ((c >> 8) & 0xFF) / 255.f, (c & 0xFF) / 255.f, ((c >> 24) & 0xFF) / 255.f };
+            // D3D9 clears ONLY the rectangles the game passes; the whole surface is cleared
+            // just when the list is empty. We ignored the list and always wiped everything,
+            // which is what painted the white square on the weapon charge effects: the game
+            // renders that effect into a 256x256 target and clears a small rect of it to
+            // white, and we whitened all 256x256. The result is then blended additively over
+            // the screen (SrcAlpha/One), so white + scene saturates to a white block.
+            // Verified in a RenderDoc capture: the effect's own geometry only covers
+            // NDC x -0.07..0.05, y -0.73..-0.63 of that target -- a small patch -- while the
+            // rest was the clear colour.
+            if (count && rects && Ctx1()) {
+                std::vector<D3D11_RECT> r; r.reserve(count);
+                for (DWORD i = 0; i < count; ++i)
+                    r.push_back(D3D11_RECT{ (LONG)rects[i].x1, (LONG)rects[i].y1, (LONG)rects[i].x2, (LONG)rects[i].y2 });
+                Ctx1()->ClearView(rt, col, r.data(), (UINT)r.size());
+                static LONG once = 0;
+                if (InterlockedIncrement(&once) == 1)
+                    Log("[ne] Clear con %u rect(s): (%d,%d)-(%d,%d) color=%08X\n", count,
+                        rects[0].x1, rects[0].y1, rects[0].x2, rects[0].y2, c);
+            } else {
+                g.ctx->ClearRenderTargetView(rt, col);
+            }
+        }
+        // the CURRENT depth, not always the screen one: with a render target pushed, the
+        // engine expects its own depth to be the one cleared.
+        ID3D11DepthStencilView* ds = g.curDSV ? g.curDSV : g.dsv;
+        if (g.ctx && ds && (flags & (D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL))) {
             UINT df = ((flags & D3DCLEAR_ZBUFFER) ? D3D11_CLEAR_DEPTH : 0) | ((flags & D3DCLEAR_STENCIL) ? D3D11_CLEAR_STENCIL : 0);
-            g.ctx->ClearDepthStencilView(g.dsv, df, z, (UINT8)stencil);
+            g.ctx->ClearDepthStencilView(ds, df, z, (UINT8)stencil);
         }
         return D3D_OK;
     }
@@ -1364,6 +1494,35 @@ struct NDevice : Unk<IDirect3DDevice9> {
                 (int)PoolDestroySkipped(), (int)(g_shadowKB / 1024), (int)DequeRescued());
             lastGuard = gc;
             t_frameTotal = 0; t_inBackend = 0;
+        }
+        // [map] -- why the weapon charge effects render on some maps and not others.
+        //
+        // The refraction effect these weapons use only paints the SCENE texture
+        // (tex2Dproj(SceneMapSampler,...)), and that texture is refreshed by
+        // CRenderer_D3D::UpdateScreenTexture -- which the engine only calls inside the
+        // glow/haze/fullscene passes. Those passes are skipped WHOLESALE when the map has
+        // no objects in their lists (CRenderScene_RenderGlowPass @0x01CE2E70 bails on an
+        // empty renderer+0x194/0x198), so on a map with no glow geometry nobody refreshes
+        // it and our sampler falls back to white -> the white square.
+        //
+        // The three weights below are per-map: CBgInfo_ParseRendererSection reads
+        // FullSceneGlow{,Org,Peri}ColorRev from the map's bginfo and
+        // CMapRenderSettings_Apply publishes them here when the map loads. They are the
+        // cheapest per-map fingerprint we can read without hooking anything.
+        // dbg_sceneCopy counts our StretchRect into the 512x512 target, i.e. how many
+        // times the scene texture was actually refreshed.
+        if ((ff % 120) == 2) {
+            static int lastKey = -1; static LONG lastCopy = 0;
+            int mil[3]; ReadGlowWeights(mil);
+            LONG copies = dbg_sceneCopy - lastCopy; lastCopy = dbg_sceneCopy;
+            int key = mil[0] * 31 + mil[1] * 7 + mil[2];
+            // log on every map change, and every 120 frames while the scene texture is dead
+            if (key != lastKey || copies == 0) {
+                Log("[map] glow ColorRev=%d/1000 Org=%d/1000 Peri=%d/1000 | sceneTexUpdates=%d/120frames%s\n",
+                    mil[0], mil[1], mil[2], (int)copies,
+                    copies == 0 ? "  <-- SCENE TEXTURE NEVER REFRESHED: effects that sample it fall back to white" : "");
+                lastKey = key;
+            }
         }
         // Dumping the backbuffer to BMP creates a fullscreen staging texture and maps it
         // for reading: that syncs with the GPU and writes 8MB to disk every second.
@@ -1581,11 +1740,12 @@ struct NDevice : Unk<IDirect3DDevice9> {
         curRTSurf = surf;
         NE_RTView* v = NE_QueryRT(surf);
         g.curRTV = (v && v->rtv) ? v->rtv : g.rtv; // no rtv of its own (or a cached backbuffer) -> backbuffer
-        g.ctx->OMSetRenderTargets(1, &g.curRTV, g.curDSV);
+        g.ctx->OMSetRenderTargets(1, &g.curRTV, EffDSV());
         // D3D9 resets the viewport to the target size on every SetRenderTarget.
         curVP.X = 0; curVP.Y = 0; curVP.MinZ = 0.f; curVP.MaxZ = 1.f;
         if (v && v->rtv && v->w) { curVP.Width = v->w; curVP.Height = v->h; }
         else { curVP.Width = g.bbW; curVP.Height = g.bbH; } // backbuffer -> full screen
+        g_effectTargetNeedsAlphaClear = v && v->rtv && v->w == 256 && v->h == 256;
         ApplyViewport();
         return D3D_OK;
     }
@@ -1593,8 +1753,19 @@ struct NDevice : Unk<IDirect3DDevice9> {
         CtxLock lk;
         curDSSurf = surf;
         NE_RTView* v = NE_QueryRT(surf);
-        g.curDSV = (v && v->dsv) ? v->dsv : g.dsv;
-        g.ctx->OMSetRenderTargets(1, &g.curRTV, g.curDSV);
+        // NULL means "no depth buffer" in D3D9: depth testing and writing are off. It is
+        // what the engine passes before drawing into an offscreen effect target. Falling
+        // back to the screen depth here is what painted the white square on the weapon
+        // charge effects: the effect renders into a 256x256 target that was just cleared
+        // to opaque white, and with the 1680x1050 scene depth still bound its fragments
+        // get depth-tested against the top-left corner of the scene and rejected, so the
+        // target keeps the clear colour. Which is also why it only happened on some maps
+        // -- whether those stale depths reject the effect depends on what the map draws
+        // in that corner. Confirmed in a RenderDoc capture: EIDs 5380/5382/5393/5406 all
+        // flagged "depth target is larger than render target", and the saved 256x256
+        // target after the draw is white.
+        g.curDSV = (v && v->dsv) ? v->dsv : (surf ? g.dsv : nullptr);
+        g.ctx->OMSetRenderTargets(1, &g.curRTV, EffDSV());
         return D3D_OK;
     }
     STDMETHOD(SetTransform)(D3DTRANSFORMSTATETYPE s, const D3DMATRIX* m) {
@@ -1619,7 +1790,12 @@ struct NDevice : Unk<IDirect3DDevice9> {
     }
     STDMETHOD(GetTransform)(D3DTRANSFORMSTATETYPE, D3DMATRIX*) { return D3D_OK; }
     STDMETHOD(MultiplyTransform)(D3DTRANSFORMSTATETYPE, const D3DMATRIX*) { return D3D_OK; }
-    STDMETHOD(SetViewport)(const D3DVIEWPORT9* v) { if (v) curVP = *v; return D3D_OK; }
+    STDMETHOD(SetViewport)(const D3DVIEWPORT9* v) {
+        if (v) {
+            curVP = *v;
+        }
+        return D3D_OK;
+    }
     STDMETHOD(GetViewport)(D3DVIEWPORT9* v) { if (v) *v = curVP; return D3D_OK; }
     void ApplyViewport() { D3D11_VIEWPORT vp{}; vp.TopLeftX = (float)curVP.X; vp.TopLeftY = (float)curVP.Y; vp.Width = (float)curVP.Width; vp.Height = (float)curVP.Height; vp.MinDepth = curVP.MinZ; vp.MaxDepth = curVP.MaxZ; g.ctx->RSSetViewports(1, &vp); }
     STDMETHOD(SetMaterial)(const D3DMATERIAL9*) { return D3D_OK; }
@@ -1656,7 +1832,25 @@ struct NDevice : Unk<IDirect3DDevice9> {
     STDMETHOD(SetClipStatus)(const D3DCLIPSTATUS9*) { return D3D_OK; }
     STDMETHOD(GetClipStatus)(D3DCLIPSTATUS9* s) { if (s) ZeroMemory(s, sizeof(*s)); return D3D_OK; }
     STDMETHOD(GetTexture)(DWORD, IDirect3DBaseTexture9** pp) { *pp = nullptr; return D3D_OK; }
-    STDMETHOD(SetTexture)(DWORD s, IDirect3DBaseTexture9* t) { if (s < 8) tex[s] = (NTexture*)t; return D3D_OK; }
+    STDMETHOD(SetTexture)(DWORD s, IDirect3DBaseTexture9* t) {
+        if (s < 8) tex[s] = (NTexture*)t;
+        // Remember the light ramp. When g_TexShadeMap does not resolve we used to take
+        // whatever happened to be bound to stage 1 at that instant, and stage 1 is mutable
+        // global state: any effect that binds a sprite there becomes the light ramp for the
+        // next world draw, so the map's lighting jumps for a few frames. That is the flicker.
+        // The real ramp is recognisable -- the clean client binds a 256x1 strip here
+        // (confirmed with the spy DLL) -- so we latch onto that and ignore everything else.
+        // We hold a reference: the texture can be destroyed on a map change and a stale SRV
+        // would be a dangling pointer.
+        if (s == 1) {
+            NTexture* n = (NTexture*)t;
+            if (n && n->srv && n->w == 256 && n->h <= 2 && n->srv != g_rampSRV) {
+                if (g_rampSRV) g_rampSRV->Release();
+                g_rampSRV = n->srv; g_rampSRV->AddRef();
+            }
+        }
+        return D3D_OK;
+    }
     STDMETHOD(GetTextureStageState)(DWORD s, D3DTEXTURESTAGESTATETYPE t, DWORD* v) { if (v) *v = (s < 8 && t < 8) ? tss[s][t] : 0; return D3D_OK; }
     // The engine uses the fixed-function stage pipeline for everything that is not .fx
     // (CTextureState_D3D::Apply @0x01D8E0C0 sets COLOROP/ARG1/ARG2 and ALPHAOP/ARG1/ARG2).
@@ -1694,6 +1888,14 @@ struct NDevice : Unk<IDirect3DDevice9> {
     // --- draws ---
     // programmable path: the effect already bound VS/PS/cbuffers/SRVs/states; here we
     // set RT/viewport/input layout (from the vertex decl)/VB/IB and draw.
+    // The scene depth (g.dsv) is backbuffer-sized. Binding it to a smaller offscreen
+    // render target makes D3D11 reject every draw ("depth target larger than render
+    // target"), so the weapon-charge glow renders into a 256x256 buffer that keeps its
+    // white clear and the additive composite paints a white square -- worst from below,
+    // where the effect sits against the screen edge. Only the backbuffer matches g.dsv;
+    // on any other render target, run depthless. This is the draw-time catch-all that
+    // covers the cases SetDepthStencilSurface(NULL) alone did not.
+    ID3D11DepthStencilView* EffDSV() { return (g.curDSV == g.dsv && g.curRTV != g.rtv) ? nullptr : g.curDSV; }
     bool BeginProgDraw() {
         if (!g_prog.active) return false;
         CtxLock lk;
@@ -1711,8 +1913,13 @@ struct NDevice : Unk<IDirect3DDevice9> {
             for (int i = 0; i < g_passStateCount; ++i) if (g_passState[i] == state) return g_passValue[i];
             return rs[state];
         };
-        g.ctx->OMSetRenderTargets(1, &g.curRTV, g.curDSV);
+        g.ctx->OMSetRenderTargets(1, &g.curRTV, EffDSV());
         ApplyViewport();
+        if (g_effectTargetNeedsAlphaClear && g.curRTV != g.rtv && curVP.Width == 256 && curVP.Height == 256) {
+            const float transparent[4] = { 1.f, 1.f, 1.f, 0.f };
+            g.ctx->ClearRenderTargetView(g.curRTV, transparent);
+            g_effectTargetNeedsAlphaClear = false;
+        }
         { float bs, sl; memcpy(&bs, &rs[D3DRS_DEPTHBIAS], 4); memcpy(&sl, &rs[D3DRS_SLOPESCALEDEPTHBIAS], 4); g.ctx->RSSetState(GetRasterizer(bs, sl, RS(D3DRS_CULLMODE), rs[D3DRS_FILLMODE])); }
         ID3D11DepthStencilState* dss = !RS(D3DRS_ZENABLE) ? g.dsOff : (RS(D3DRS_ZWRITEENABLE) ? g.dsWrite : g.dsNoWrite);
         g.ctx->OMSetDepthStencilState(dss, 0);
@@ -1721,7 +1928,10 @@ struct NDevice : Unk<IDirect3DDevice9> {
         static int opaqueTest = -1;
         if (opaqueTest < 0) { char b[8]; opaqueTest = GetEnvironmentVariableA("NE_OPAQUE", b, 8) ? 1 : 0; }
         if (opaqueTest) { g.ctx->OMSetBlendState(nullptr, bf, 0xffffffff); }
-        else if (RS(D3DRS_ALPHABLENDENABLE)) g.ctx->OMSetBlendState(GetBlend(RS(D3DRS_SRCBLEND), RS(D3DRS_DESTBLEND)), bf, 0xffffffff);
+        // The .fx pass can declare BlendOp just like it declares AlphaBlendEnable, and the
+        // parser already reads it -- it was GetBlend that threw it away. Same bug as the
+        // wall jump / dagger square: a render state the pass asks for and we ignored.
+        else if (RS(D3DRS_ALPHABLENDENABLE)) g.ctx->OMSetBlendState(GetBlend(RS(D3DRS_SRCBLEND), RS(D3DRS_DESTBLEND), RS(D3DRS_BLENDOP)), bf, 0xffffffff);
         else g.ctx->OMSetBlendState(nullptr, bf, 0xffffffff);
         // Fog goes in its own cbuffer at b1, refilled HERE (per draw) and not in
         // BeginPass. The game toggles FOGENABLE per object, so this is the only place
@@ -1965,6 +2175,8 @@ ID3D11Device* NE_Dev() { return g.dev; }
 ID3D11DeviceContext* NE_Ctx() { return g.ctx; }
 ID3D11ShaderResourceView* NE_SRV(IDirect3DBaseTexture9* tex9) { return tex9 ? ((NTexture*)tex9)->srv : nullptr; }
 ID3D11ShaderResourceView* NE_DeviceTexSRV(UINT stage) { NDevice* d = (NDevice*)g_dev9; return (d && stage < 8 && d->tex[stage]) ? d->tex[stage]->srv : nullptr; }
+// The last texture bound to stage 1 that actually looks like a light ramp (256x1).
+ID3D11ShaderResourceView* NE_ShadeRampSRV() { return g_rampSRV; }
 ID3D11PixelShader* NE_FixedFuncPS() { return g.psFF1; }
 // The .fx passes with PixelShader = null use the fixed-function pixel pipeline.
 // We upload the texture stage states + tfactor + alpha test to the device cbuffer and

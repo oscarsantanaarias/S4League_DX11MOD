@@ -62,7 +62,7 @@ All of these are work in progress. None of them breaks the client.
 
 | Issue | State |
 |---|---|
-| **Some weapon animations render a white square instead of the charge effect** — the basic (non-skin) Mind Shock and Mind Heal, and the railgun charge | open — and it is **map dependent**: the effects render correctly on Station 1, Station 2, Wonderland, Ice Square and Neden 3 (confirmed so far — there are more, still to be verified), and give the white square on the rest. So it is the environment the effect samples (scene texture, map bginfo, post-process passes), not the weapon |
+| **Some weapon animations render a white square instead of the charge effect** — the basic (non-skin) Mind Shock and Mind Heal, and the railgun charge | open — it is **camera-position dependent**, not map dependent: on the same map, moving the camera turns the correct blue halo into a white block. The glow is rendered into an offscreen buffer cleared to white and the sprite lands off-centre inside it, so the compositing quad shows the clear colour instead of the glow |
 | **Fog is not visible** | open — the shader wrapper compiles and the constants are fed per draw, but nothing shows up |
 | **The map flickers with many players on screen** | open — not diagnosed yet |
 

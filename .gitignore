@@ -20,3 +20,6 @@ all map.txt
 text all.txt
 spy/*.obj
 spy/*.dll
+renderer_documentation.txt
+report.txt
+solution_tocado.txt

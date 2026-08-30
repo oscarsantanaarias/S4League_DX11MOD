@@ -254,13 +254,23 @@ struct MyEffect : public ID3DXEffect {
             ID3D11Texture2D* gt = nullptr; if (SUCCEEDED(dev->CreateTexture2D(&td, &srd, &gt)) && gt) { dev->CreateShaderResourceView(gt, nullptr, &graySRV); gt->Release(); }
             UINT black = 0x00000000; srd.pSysMem = &black;
             ID3D11Texture2D* bt = nullptr; if (SUCCEEDED(dev->CreateTexture2D(&td, &srd, &bt)) && bt) { dev->CreateShaderResourceView(bt, nullptr, &blackSRV); bt->Release(); }
-            // A bump/normal map is not a colour: white means the normal (1,1,1)
-            // unnormalized, so every surface gets lit as if it faced diagonally and
-            // burns out. The neutral is (0.5,0.5,1) = the normal (0,0,1), straight up.
-            UINT flat = 0xFFFF8080; srd.pSysMem = &flat;   // R=0x80 G=0x80 B=0xFF A=0xFF
+            // A bump map is not a colour, and in THIS shader family it is not used as a
+            // normal either -- every use is a dot product against the light or half vector
+            // in tangent space:
+            //     BumpMapColor = (tex - 0.5) * 2;
+            //     DifPow   = g_BumpDepth * dot(BumpMapColor, In.L) + 0.5;
+            //     SpePower = pow(max(dot(BumpMapColor, In.H), 0), g_SpecularShiness);
+            // So the neutral is the ZERO vector, i.e. 0.5 grey, which gives dot = 0 and a
+            // constant DifPow of 0.5. The old (0.5,0.5,1) "flat normal" decodes to (0,0,1),
+            // whose dot with L is L.z -- that makes the brightness swing with the light
+            // angle and blow out to white from certain camera positions. Same family as the
+            // white characters: a lighting term that depends on the angle when it must not.
+            UINT flat = 0xFF808080; srd.pSysMem = &flat;   // R=G=B=0x80 -> (tex-0.5)*2 = 0
             ID3D11Texture2D* nt = nullptr; if (SUCCEEDED(dev->CreateTexture2D(&td, &srd, &nt)) && nt) { dev->CreateShaderResourceView(nt, nullptr, &normalSRV); nt->Release(); }
         }
-        Log("[fx] MyEffect: %d techniques, hlsl %d bytes\n", (int)techs.size(), (int)hlsl.size());
+        CollectParamNames();
+        Log("[fx] MyEffect: %d techniques, %d parameters, hlsl %d bytes\n",
+            (int)techs.size(), (int)paramNames.size(), (int)hlsl.size());
         // Dump the .fx source so the transpiled shaders can be read offline. The
         // effects that render white resolve every texture and get the right blend
         // state, so whatever is wrong is inside the shader itself.
@@ -283,10 +293,24 @@ struct MyEffect : public ID3DXEffect {
     // specular (white depending on the camera).
     void ParseDefaults(const std::string& s) {
         static const char* kTypes[] = { "float4", "float3", "float2", "float", "int", "bool", "half" };
+        // Only GLOBAL declarations are parameters. This used to scan the whole source, so
+        // shader LOCALS ("float4 RefractionMapColor = tex2D(...);" inside a function body)
+        // were registered as parameters with a bogus default. That is the same bug that
+        // once left g_matBone empty -> broken skinning -> garbage normal -> DifPow NaN ->
+        // WHITE CHARACTERS. Uniforms sit at brace depth 0; function bodies and
+        // sampler_state blocks are deeper, so a depth map separates them.
+        std::vector<int> depth(s.size() + 1, 0);
+        { int d = 0;
+          for (size_t i = 0; i < s.size(); ++i) {
+              if (s[i] == '{') { depth[i] = d; d++; }
+              else if (s[i] == '}') { if (d > 0) d--; depth[i] = d; }
+              else depth[i] = d;
+          } }
         for (const char* ty : kTypes) {
             size_t tlen = strlen(ty), p = 0;
             while ((p = s.find(ty, p)) != std::string::npos) {
                 size_t q = p + tlen;
+                if (depth[p] != 0) { p = q; continue; }   // inside a function or a block
                 if (p > 0 && (isalnum((unsigned char)s[p - 1]) || s[p - 1] == '_')) { p = q; continue; }
                 if (q < s.size() && (isalnum((unsigned char)s[q]) || s[q] == '_')) { p = q; continue; }
                 while (q < s.size() && isspace((unsigned char)s[q])) q++;
@@ -296,7 +320,24 @@ struct MyEffect : public ID3DXEffect {
                 if (name.empty() || q >= s.size() || s[q] != '=') { p = ns + 1; continue; }
                 size_t semi = s.find(';', q); if (semi == std::string::npos) break;
                 std::string rhs = s.substr(q + 1, semi - q - 1);
-                // pull the numbers out of the right hand side (supports floatN(a,b,c))
+                // Strip a leading constructor before scanning for numbers. The digit in the
+                // TYPE NAME is a number too: "float3( 0.2126, 0.7152, 0.0722 )" was read as
+                // (3.0, 0.2126, 0.7152), shifting every component by one. That is why
+                // g_SaturationConst came out as 3.0 while g_LuminanceConv, written with
+                // braces instead, parsed correctly.
+                {
+                    size_t par = rhs.find('(');
+                    if (par != std::string::npos) {
+                        std::string head = rhs.substr(0, par);
+                        size_t a = head.find_first_not_of(" \t\r\n");
+                        if (a != std::string::npos &&
+                            (head.compare(a, 5, "float") == 0 || head.compare(a, 4, "half") == 0 ||
+                             head.compare(a, 3, "int") == 0 || head.compare(a, 6, "matrix") == 0 ||
+                             head.compare(a, 4, "bool") == 0))
+                            rhs = rhs.substr(par + 1);
+                    }
+                }
+                // pull the numbers out of the right hand side
                 std::vector<float> v; size_t i = 0;
                 while (i < rhs.size()) {
                     if (isdigit((unsigned char)rhs[i]) || (rhs[i] == '-' && i + 1 < rhs.size() && isdigit((unsigned char)rhs[i + 1])) || rhs[i] == '.') {
@@ -313,7 +354,10 @@ struct MyEffect : public ID3DXEffect {
                         if (isInt) { int n = (int)f; BYTE* b = (BYTE*)&n; bytes.insert(bytes.end(), b, b + 4); }
                         else { BYTE* b = (BYTE*)&f; bytes.insert(bytes.end(), b, b + 4); }
                     }
-                    if (!params.count(name)) { params[name] = bytes; Log("[fx] default %s = %g (%d vals)\n", name.c_str(), v[0], (int)v.size()); }
+                    // Log() is wvsprintfA: no %f and no %g. Printing the float here made the
+                    // line read "default X = g (0 vals)", which looks like a parse failure and
+                    // is not one -- the %g swallowed the argument and %d then read garbage.
+                    if (!params.count(name)) { params[name] = bytes; Log("[fx] default %s = %d/1000 (%d vals)\n", name.c_str(), (int)(v[0] * 1000.0f), (int)v.size()); }
                 }
                 p = semi;
             }
@@ -325,9 +369,76 @@ struct MyEffect : public ID3DXEffect {
     // blotches that move with the camera (they are billboards). The web engine uses alphaTest 0.1.
     std::string src;   // the source to compile (with the alpha test wrapper if it applies)
     std::string atStruct;   // the PS input struct, for the fog wrapper
-    std::string AlphaTestWrapper(const std::string& entry) {
+    // Find an identifier as a WHOLE WORD, not as a substring. Every entry point here is a
+    // prefix of several others -- "PS_DiffuseMap" is the start of PS_DiffuseMap_Light0,
+    // PS_DiffuseMap_LightMap, PS_DiffuseMap_BumpMap_RefractionMap and a dozen more, and
+    // "sPS_DiffuseMap_LightMap" even contains it mid-token. A plain find() therefore lands
+    // on the WRONG function, and the wrapper built from it declares an input struct the
+    // vertex shader never fills: the pixel shader then reads uninitialised interpolants,
+    // which is the same failure as the old white-geometry bug (a shader input with no real
+    // data behind it) and shows up the same way -- white that changes with the camera.
+    size_t FindWord(const std::string& hay, const std::string& word, size_t from) const {
+        while (true) {
+            size_t p = hay.find(word, from);
+            if (p == std::string::npos) return std::string::npos;
+            bool okL = (p == 0) || !(isalnum((unsigned char)hay[p - 1]) || hay[p - 1] == '_');
+            size_t e = p + word.size();
+            bool okR = (e >= hay.size()) || !(isalnum((unsigned char)hay[e]) || hay[e] == '_');
+            if (okL && okR) return p;
+            from = p + 1;
+        }
+    }
+    // Member names of a struct declared in the .fx.
+    std::vector<std::string> StructMembers(const std::string& sname) {
+        std::vector<std::string> out;
+        size_t p = FindWord(hlsl, sname, 0);
+        while (p != std::string::npos) {
+            size_t br = hlsl.find('{', p);
+            size_t semi = hlsl.find(';', p);
+            if (br == std::string::npos) break;
+            if (semi != std::string::npos && semi < br) { p = FindWord(hlsl, sname, p + 1); continue; }
+            size_t end = hlsl.find('}', br);
+            if (end == std::string::npos) break;
+            std::string body = hlsl.substr(br + 1, end - br - 1);
+            size_t i = 0;
+            while (i < body.size()) {
+                size_t sc = body.find(';', i);
+                if (sc == std::string::npos) break;
+                std::string decl = body.substr(i, sc - i);
+                size_t colon = decl.find(':');
+                if (colon != std::string::npos) decl = decl.substr(0, colon);
+                size_t e = decl.find_last_not_of(" \t\n\n");
+                if (e != std::string::npos) {
+                    size_t b = e;
+                    while (b > 0 && (isalnum((unsigned char)decl[b - 1]) || decl[b - 1] == '_')) b--;
+                    std::string nm = decl.substr(b, e - b + 1);
+                    if (!nm.empty()) out.push_back(nm);
+                }
+                i = sc + 1;
+            }
+            break;
+        }
+        return out;
+    }
+    // Return type of a function = the token right before its name.
+    std::string FuncReturnType(const std::string& entry) {
+        if (entry.empty()) return "";
+        size_t p = FindWord(hlsl, entry, 0);
+        while (p != std::string::npos) {
+            size_t op = hlsl.find('(', p);
+            if (op != std::string::npos && hlsl.find_first_not_of(" \t\n\n", p + entry.size()) == op) {
+                size_t e = p; while (e > 0 && isspace((unsigned char)hlsl[e - 1])) e--;
+                size_t b = e; while (b > 0 && (isalnum((unsigned char)hlsl[b - 1]) || hlsl[b - 1] == '_')) b--;
+                std::string t = hlsl.substr(b, e - b);
+                if (!t.empty() && t != "compile") return t;
+            }
+            p = FindWord(hlsl, entry, p + 1);
+        }
+        return "";
+    }
+    std::string AlphaTestWrapper(const std::string& entry, const std::string& vsEntry) {
         // signature: float4 <entry>( <Struct> In ) : COLOR
-        size_t p = hlsl.find(entry);
+        size_t p = FindWord(hlsl, entry, 0);
         while (p != std::string::npos) {
             size_t op = hlsl.find('(', p);
             if (op == std::string::npos) break;
@@ -357,12 +468,39 @@ struct MyEffect : public ID3DXEffect {
                         // compiled and the map values arrived fine. The fallback stays
                         // independent.
                         atStruct = sname;   // enables the fog wrapper (fog now rides b1, per draw)
+                        // The .fx pairs pixel shaders with vertex shaders that do NOT write
+                        // every member the PS reads: Technique_DiffuseMap_Rigid runs
+                        // VS_DiffuseMap_Rigid (Pos + DifMapUV only) into
+                        // PS_DiffuseMap_BumpMap_RefractionMap, which reads In.L and In.H.
+                        // Those interpolants have no data behind them, and since L and H are
+                        // DIRECTIONS the garbage changes with where the camera looks: white
+                        // looking down, fine looking up. Same failure as the old white
+                        // geometry bug, where a COLOR0 with no data read vertex positions.
+                        // Give the orphans a defined value so the term is simply neutral.
+                        std::string zero;
+                        std::string vsRet = FuncReturnType(vsEntry);
+                        if (!vsRet.empty() && vsRet != sname) {
+                            auto psM = StructMembers(sname);
+                            auto vsM = StructMembers(vsRet);
+                            for (auto& m : psM) {
+                                bool have = false;
+                                for (auto& v : vsM) if (v == m) { have = true; break; }
+                                if (!have) zero += "  In." + m + " = 0;\n";
+                            }
+                            if (!zero.empty()) {
+                                static std::set<std::string> logged;
+                                if (logged.size() < 30 && logged.insert(entry).second)
+                                    Log("[fx] %s reads interpolants %s never writes -> zeroed\n",
+                                        entry.c_str(), vsEntry.c_str());
+                            }
+                        }
                         return "\nfloat g_NE_AlphaRef;\nfloat4 " + entry + "_NEAT(" + sname + " In) : COLOR {\n"
+                               + zero +
                                "  float4 c = " + entry + "(In);\n  clip(c.a - g_NE_AlphaRef);\n  return c;\n}\n";
                     }
                 }
             }
-            p = hlsl.find(entry, p + 1);
+            p = FindWord(hlsl, entry, p + 1);
         }
         return "";
     }
@@ -376,6 +514,9 @@ struct MyEffect : public ID3DXEffect {
     // compatibility POSITION already maps to it and D3DCompile rejects the duplicate
     // ("X4574: Duplicate system value semantic"). So we read the one that is there.
     std::string PositionMember(const std::string& sname) {
+        // Left as a plain find on purpose: making this whole-word changes whether the FOG
+        // wrapper compiles, which changes the compiled entry point and therefore what gets
+        // bound. Reverted to keep the known-good state while the white quad is unexplained.
         size_t p = hlsl.find("struct " + sname);
         if (p == std::string::npos) return "";
         size_t b = hlsl.find('{', p); if (b == std::string::npos) return "";
@@ -413,7 +554,7 @@ struct MyEffect : public ID3DXEffect {
                "    c.rgb = lerp(g_NE_FogColor.rgb, c.rgb, f);\n  }\n"
                "  return c;\n}\n";
     }
-    bool CompileOne(const std::string& entry, const char* target, ShaderProg& sp, bool isVS) {
+    bool CompileOne(const std::string& entry, const char* target, ShaderProg& sp, bool isVS, const std::string& vsEntry = std::string()) {
         if (entry.empty()) {
             if (isVS) return false;
             // PixelShader = null -> fixed function: sample the stage0 texture * vertex color.
@@ -433,7 +574,7 @@ struct MyEffect : public ID3DXEffect {
         std::string atOnly; // intermediate level: alpha test only
         if (!isVS) {
             atStruct.clear();
-            std::string w = AlphaTestWrapper(entry);
+            std::string w = AlphaTestWrapper(entry, vsEntry);
             if (!w.empty()) {
                 atOnly = hlsl + w; use = atOnly; ent = entry + "_NEAT";
                 if (!atStruct.empty()) {
@@ -516,7 +657,7 @@ struct MyEffect : public ID3DXEffect {
             sp->psIsFF = true; sp->ps = NE_FixedFuncPS();
             sp->ok = a && sp->vs && sp->ps;
         } else {
-            bool b = CompileOne(p.psEntry, "ps_4_0", *sp, false);
+            bool b = CompileOne(p.psEntry, "ps_4_0", *sp, false, p.vsEntry);
             sp->ok = a && b && sp->vs && sp->ps;
         }
         Log("[fx] GetProg vs=%s ps=%s ok=%d\n", p.vsEntry.c_str(), p.psEntry.c_str(), sp->ok);
@@ -579,8 +720,18 @@ struct MyEffect : public ID3DXEffect {
                 // Result: we fell back to gray 0.5, that is, a CONSTANT instead of the
                 // gradient, and all the geometry ended up equally lit.
                 const std::string n2 = tb.name + texName;
-                if (n2.find("Shade") != std::string::npos || n2.find("Light") != std::string::npos)
-                    srv = NE_DeviceTexSRV(1);
+                // The LATCHED ramp, not whatever is on stage 1 right now. Stage 1 is
+                // shared mutable state: an effect binding its sprite there turned that
+                // sprite into the world's light ramp for a frame, and the map's lighting
+                // jumped -- the flicker seen while using weapons.
+                // NE_NO_LIGHTS=1 skips the ramp entirely: Shade/Light samplers fall to the
+                // neutral gray below, i.e. flat lighting. Isolation switch for the flicker
+                // and the heap crash: if either survives with this on, the ramp path is
+                // innocent.
+                static int noLights = -1;
+                if (noLights < 0) { char e[8] = ""; noLights = (GetEnvironmentVariableA("NE_NO_LIGHTS", e, sizeof(e)) && e[0] == '1') ? 1 : 0; }
+                if (!noLights && (n2.find("Shade") != std::string::npos || n2.find("Light") != std::string::npos))
+                    srv = NE_ShadeRampSRV();
             }
             if (logIt) { dbg += tb.name; dbg += "->"; dbg += texName; dbg += srv ? "=Y " : "=N "; }
             if (!srv) {
@@ -596,7 +747,11 @@ struct MyEffect : public ID3DXEffect {
                 //  - Diffuse: it is MULTIPLIED -> white.
                 const std::string n = tb.name + texName;
                 auto has = [&](const char* w) { return n.find(w) != std::string::npos; };
-                if (has("Scene") || has("Screen") || has("Refraction")) srv = NE_SceneSRV();
+                // FullScene/Refraction effects use g_TexDiffuseMap for the scene even
+                // though the variable name does not contain "Scene".
+                if (has("Scene") || has("Screen") || has("Refraction")) {
+                    srv = NE_SceneSRV();
+                }
                 if (srv) { /* the real scene */ }
                 else if (has("Bump") || has("Normal")) srv = normalSRV;
                 else if (has("Blur") || has("Mask") || has("Specular") || has("Shadow") || NE_IsAdditive()) srv = blackSRV;
@@ -621,6 +776,14 @@ struct MyEffect : public ID3DXEffect {
             // divide is by zero and the whole quad samples garbage.
             std::string vd;
             for (auto& v : sp->vsVars) { vd += v.name; vd += params.count(v.name) ? "=Y " : "=N "; }
+            for (auto& v : sp->psVars) {
+                vd += v.name;
+                auto pit = params.find(v.name);
+                if (pit == params.end() || pit->second.size() < 4) { vd += "=N "; continue; }
+                float fv = 0.f; memcpy(&fv, pit->second.data(), 4);
+                char nb[48]; wsprintfA(nb, "=%d/1000 ", (int)(fv * 1000.0f));
+                vd += nb;
+            }
             Log("[add] vs=%s tex[%s]\n[add]   vars: %s\n", sp->vsName.c_str(), dbg.c_str(), vd.c_str());
         }
         // One sampler per slot according to what the .fx declares: the ones that ask
@@ -650,6 +813,46 @@ struct MyEffect : public ID3DXEffect {
     STDMETHOD_(ULONG, Release)() { LONG r = InterlockedDecrement(&ref); if (r == 0) delete this; return r; }
 
     // ===== ID3DXBaseEffect =====
+    // The engine DISCOVERS parameters by enumeration, not only by name: it walks
+    // GetParameter(NULL, i) and caches the handles (the client keeps 15 of them at
+    // this+0x84 and skips any that come back null). We reported zero parameters and
+    // returned null for every index, so the engine cached nothing and never called the
+    // setters -- g_vEyePos, for one, stayed at zero forever. That leaves
+    // V = normalize(g_vEyePos - tmpPos) pointing at the world origin instead of the
+    // camera, so the view-dependent terms are wrong and swing with where you look.
+    // Same shape as the white-character bug: something the shader reads that nothing fills.
+    std::vector<std::string> paramNames;
+    void CollectParamNames() {
+        static const char* kT[] = { "float4x4", "float4", "float3", "float2", "float",
+                                    "matrix", "texture", "int", "bool", "half" };
+        std::vector<int> depth(hlsl.size() + 1, 0);
+        { int d = 0;
+          for (size_t i = 0; i < hlsl.size(); ++i) {
+              if (hlsl[i] == '{') { depth[i] = d; d++; }
+              else if (hlsl[i] == '}') { if (d > 0) d--; depth[i] = d; }
+              else depth[i] = d;
+          } }
+        std::set<std::string> seen;
+        for (const char* ty : kT) {
+            size_t tlen = strlen(ty), p = 0;
+            while ((p = hlsl.find(ty, p)) != std::string::npos) {
+                size_t q = p + tlen;
+                if (depth[p] != 0) { p = q; continue; }
+                if (p > 0 && (isalnum((unsigned char)hlsl[p - 1]) || hlsl[p - 1] == '_')) { p = q; continue; }
+                if (q < hlsl.size() && (isalnum((unsigned char)hlsl[q]) || hlsl[q] == '_')) { p = q; continue; }
+                while (q < hlsl.size() && isspace((unsigned char)hlsl[q])) q++;
+                size_t ns = q;
+                while (q < hlsl.size() && (isalnum((unsigned char)hlsl[q]) || hlsl[q] == '_')) q++;
+                std::string nm = hlsl.substr(ns, q - ns);
+                // a declaration ends in ; = or [ ; anything else is a cast or a local
+                size_t r = hlsl.find_first_not_of(" \t\r\n", q);
+                bool decl = (r != std::string::npos) && (hlsl[r] == ';' || hlsl[r] == '=' || hlsl[r] == '[');
+                if (decl && !nm.empty() && nm.compare(0, 2, "g_") == 0 && seen.insert(nm).second)
+                    paramNames.push_back(nm);
+                p = ns + 1;
+            }
+        }
+    }
     STDMETHOD(GetDesc)(D3DXEFFECT_DESC* d) { if (d) { d->Creator = "NativeEngine"; d->Parameters = 0; d->Techniques = (UINT)techs.size(); d->Functions = 0; } return D3D_OK; }
     STDMETHOD(GetParameterDesc)(D3DXHANDLE h, D3DXPARAMETER_DESC* d) {
         if (!d) return D3D_OK; ZeroMemory(d, sizeof(*d));
@@ -666,6 +869,9 @@ struct MyEffect : public ID3DXEffect {
     }
     STDMETHOD(GetPassDesc)(D3DXHANDLE h, D3DXPASS_DESC* d) { if (!d) return D3D_OK; ZeroMemory(d, sizeof(*d)); d->Name = h ? (LPCSTR)h : "p0"; return D3D_OK; }
     STDMETHOD(GetFunctionDesc)(D3DXHANDLE h, D3DXFUNCTION_DESC* d) { if (!d) return D3D_OK; ZeroMemory(d, sizeof(*d)); d->Name = h ? (LPCSTR)h : "f0"; return D3D_OK; }
+    // Reverted: enumerating parameters made the engine set more of them and that FLIPPED
+    // which camera angle shows the white quad (from "up is fine" to "down is fine"). Kept
+    // off until the quad itself is understood, so the known-better state is the one shipped.
     STDMETHOD_(D3DXHANDLE, GetParameter)(D3DXHANDLE, UINT) { return nullptr; }
     STDMETHOD_(D3DXHANDLE, GetParameterByName)(D3DXHANDLE, LPCSTR name) { return Intern(name); }
     STDMETHOD_(D3DXHANDLE, GetParameterBySemantic)(D3DXHANDLE, LPCSTR) { return nullptr; }
@@ -729,21 +935,105 @@ struct MyEffect : public ID3DXEffect {
     // ===== ID3DXEffect =====
     STDMETHOD(GetPool)(LPD3DXEFFECTPOOL* p) { if (p) *p = nullptr; return D3D_OK; }
     STDMETHOD(SetTechnique)(D3DXHANDLE h) {
-        curTech = 0;
-        if (h) for (size_t i = 0; i < techs.size(); ++i) if (techs[i].name == (const char*)h) { curTech = (int)i; break; }
+        // The engine picks techniques BY NAME (it caches ~60 handles with
+        // GetTechniqueByName at startup, see sub_11D6910 in the client). If the name does
+        // not match anything we parsed we used to silently fall back to technique 0 and
+        // still return D3D_OK, so the game would draw with a completely different shader
+        // and never know. Different parts of one weapon use different techniques, which is
+        // exactly how an effect ends up "half fixed".
+        int found = -1;
+        if (h) for (size_t i = 0; i < techs.size(); ++i) if (techs[i].name == (const char*)h) { found = (int)i; break; }
+        if (found < 0 && h) {
+            static std::set<std::string> missed;
+            if (missed.size() < 40 && missed.insert((const char*)h).second)
+                Log("[fx] SetTechnique NO MATCH: \"%s\" (parsed=%d) -> falls back to technique 0\n",
+                    (const char*)h, (int)techs.size());
+        }
+        curTech = found >= 0 ? found : 0;
         return D3D_OK;
     }
     STDMETHOD_(D3DXHANDLE, GetCurrentTechnique)() { return (curTech >= 0 && curTech < (int)techs.size()) ? Intern(techs[curTech].name.c_str()) : nullptr; }
     STDMETHOD(ValidateTechnique)(D3DXHANDLE) { return D3D_OK; }
     STDMETHOD(FindNextValidTechnique)(D3DXHANDLE, D3DXHANDLE* p) { if (p) *p = techs.empty() ? nullptr : Intern(techs[0].name.c_str()); return D3D_OK; }
-    STDMETHOD_(BOOL, IsParameterUsed)(D3DXHANDLE, D3DXHANDLE) { return TRUE; }
+    // Body of an entry point in the .fx source, so we can tell whether it mentions a
+    // parameter. Returns an empty string when the function is not found.
+    std::string FuncBody(const std::string& entry) {
+        if (entry.empty()) return std::string();
+        size_t p = 0;
+        while ((p = FindWord(hlsl, entry, p)) != std::string::npos) {
+            size_t after = p + entry.size();
+            size_t op = hlsl.find_first_not_of(" \t\r\n", after);
+            // the definition is "<entry> (" ; a call site is preceded by "= compile ..."
+            if (op == std::string::npos || hlsl[op] != '(') { p = after; continue; }
+            size_t br = hlsl.find('{', op);
+            if (br == std::string::npos) return std::string();
+            int depth = 0;
+            for (size_t i = br; i < hlsl.size(); ++i) {
+                if (hlsl[i] == '{') depth++;
+                else if (hlsl[i] == '}' && --depth == 0) return hlsl.substr(br, i - br + 1);
+            }
+            return std::string();
+        }
+        return std::string();
+    }
+    // The engine builds a 29x15 "does technique T use parameter P" table at load time
+    // (sub_11D6910 in the client calls this for every pair) and drives its technique
+    // choice from it. Returning TRUE for everything made all 435 cells true, so the
+    // engine could not tell the techniques apart and picked the wrong shader for some
+    // effects -- which is why a weapon could come out half right.
+    //
+    // A texture parameter is used INDIRECTLY: the shader body names the sampler, and the
+    // sampler declares "Texture = <g_TexWhatever>". So the aliases of a parameter are the
+    // parameter itself plus every sampler bound to it.
+    STDMETHOD_(BOOL, IsParameterUsed)(D3DXHANDLE hParam, D3DXHANDLE hTech) {
+        if (!hParam) return FALSE;
+        if (!hTech) return TRUE;   // no technique given: cannot rule it out
+        const std::string param = (const char*)hParam;
+        const std::string tech = (const char*)hTech;
+        auto key = tech + "|" + param;
+        auto it = usedCache.find(key);
+        if (it != usedCache.end()) return it->second ? TRUE : FALSE;
+
+        std::vector<std::string> alias{ param };
+        for (auto& sm : samplerToTex) if (sm.second == param) alias.push_back(sm.first);
+
+        bool used = false;
+        for (auto& t : techs) {
+            if (t.name != tech) continue;
+            for (auto& ps : t.passes) {
+                std::string body = FuncBody(ps.vsEntry) + FuncBody(ps.psEntry);
+                if (body.empty()) { used = true; break; }   // cannot tell -> assume used
+                for (auto& a : alias) if (body.find(a) != std::string::npos) { used = true; break; }
+                if (used) break;
+            }
+            break;
+        }
+        usedCache[key] = used;
+        return used ? TRUE : FALSE;
+    }
+    std::unordered_map<std::string, bool> usedCache;
     STDMETHOD(Begin)(UINT* passes, DWORD) {
         int t = curTech >= 0 ? curTech : 0;
         if (passes) *passes = (t < (int)techs.size()) ? (UINT)techs[t].passes.size() : 0;
         return D3D_OK;
     }
     STDMETHOD(BeginPass)(UINT pass) {
-        static LONG bc = 0; if (InterlockedIncrement(&bc) <= 12) Log("[fx] BeginPass tech=%d pass=%u\n", curTech, pass);
+        // Which technique the ENGINE actually asked for, and which entry points we bound
+        // for it. If a Light1 technique lands on a shader without DifPow, the lighting term
+        // is garbage and the result goes white depending on the angle -- the same mechanism
+        // as the white characters (DifPow = 0.5*dot(N,L)+0.5 is angle dependent by
+        // definition, which is why that bug moved with the camera).
+        {
+            int tt = curTech >= 0 ? curTech : 0;
+            if (tt < (int)techs.size() && pass < techs[tt].passes.size()) {
+                static std::set<std::string> seenPass;
+                std::string k = techs[tt].name + "#" + std::to_string(pass);
+                if (seenPass.size() < 60 && seenPass.insert(k).second)
+                    Log("[tech] %s pass=%u -> vs=%s ps=%s\n", techs[tt].name.c_str(), pass,
+                        techs[tt].passes[pass].vsEntry.c_str(),
+                        techs[tt].passes[pass].psEntry.empty() ? "(null->fixedfunc)" : techs[tt].passes[pass].psEntry.c_str());
+            }
+        }
         int t = curTech >= 0 ? curTech : 0;
         if (t >= (int)techs.size() || pass >= techs[t].passes.size()) return D3D_OK;
         // projected shadows can be drawn now: they are passes with PixelShader = null

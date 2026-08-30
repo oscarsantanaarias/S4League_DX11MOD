@@ -37,47 +37,114 @@ at fault.
 Everything below still happens in game. Nothing here breaks the client: it runs, it is
 playable, and the frame rate is fine. These are visual.
 
-### 1. Some weapon animations do not render ON SOME MAPS
-The basic (non-skin) Mind Shock and Mind Heal, and the railgun charge, render a **white
-square instead of the charge animation** — but only on SOME maps. On Station 2 the
-railgun charge shows up perfectly (the radial arc gauge and its glow); on other maps the
-same weapon, same skin, same everything, gives the white square.
+### 1. A white square is drawn OVER the weapon glow (camera dependent)
+The glow itself renders **correctly** — the blue halo is there. What is wrong is a
+**separate quad drawn on top of it**, opaque white. Two draws, not one broken effect.
+This corrects the framing this issue carried all day.
 
-Maps where the effect renders CORRECTLY, confirmed in game so far:
-**Station 1, Station 2, Wonderland, Ice Square, Neden 3.**
-There are more, they just have not been verified yet — the list is what has actually
-been seen in game, not the complete set.
-On the rest the same weapon gives the white square. That list is the most useful piece
-of evidence there is: diff the bginfo `[RENDERER]` block of these five against a map
-where it fails and see which key differs (fog range/colour, shademap texture,
-FullSceneGlow*), then check that key against what the effect's pass samples.
+It is **camera dependent, not map dependent**. Same map, seconds apart, only the camera
+moved: from most angles it is now fine, from below the white quad still covers the halo.
+The old "fails on Station 1/2, Wonderland, Ice Square, Neden 3" list was just where it had
+been seen; every bginfo correlation chased on that premise was chasing nothing.
 
-That makes it a MAP-dependent bug, not a weapon-dependent one. The weapon effect is a
-constant; what changes between maps is the environment the effect samples from: the
-scene/refraction texture, the bginfo `[RENDERER]` block (fog range and colour, shademap
-texture, light position), and the set of post-process passes the map runs. Two maps
-therefore leave a different device state around the same draw.
+**The offending draw**, from a RenderDoc pixel history on a white pixel:
+```
+EID 5382  ClearRenderTargetView(1,1,1,1)  -> texture 6082, a 256x256 offscreen target
+EID 5406  Draw(42)                        -> one effect sprite into a corner of it
+EID 6188  DrawIndexed(6)  SRV=6082        -> quad on screen, SrcAlpha/One (additive)
+```
+`EID 6188` uses `Technique_DiffuseMap_Light0`, whose `PS_DiffuseMap_Light0` returns the
+texture **verbatim** — no vertex colour, no modulation. So whatever is in that 256x256
+buffer goes straight to the screen. It is white, so the quad is white.
 
-The custom/skin versions of the same weapons are fine on maps where the basic ones fail,
-which is the second clue: whatever separates a skin effect from a basic one is on the
-same path as whatever separates one map from another.
+**What is missing:** nothing fills that buffer with the scene. `GetUsage` on 6082 lists
+exactly four events — the clear, one draw, two samples. In the engine the glow/blur chain
+should put the blurred scene there:
+`CRenderer_D3D::UpdateScreenTexture` (0x01C84680) is
+`dev->StretchRect(GetRenderTarget(0) -> screenTex->GetSurfaceLevel(0))`, which fills the
+512x512 screen texture (verified correct: dumped, it holds the real scene), and
+`CFullSceneBlurShader_BindSceneTexture` (0x01CBDA00, vtable 0x023FB904) feeds that texture
+to the blur as `g_TexDiffuseMap`. Where the blur's OUTPUT goes, and why it never lands in
+the 256x256, is the open question. Next step: find the owner of that vtable and the render
+target it pushes.
 
-Next step is to compare, on a map where it works against a map where it does not, the
-device state around that exact draw: which SRV lands on the scene sampler, and which
-render states the surrounding passes left behind.
+**MEASURED 2026-08-22 (logs [glowprog]/[glowdraw]/[clr], do not re-derive):**
+- The draw INTO the 256x256 (texture 6082) is a **program/effect draw**, NOT the
+  fixed-function path — the FVF log ([glowdraw]) is empty; only [glowprog] fires.
+  So every RHW/vpW/Y-flip fix tried in the FVF default shader (line ~1335, VS at
+  line ~481) is on the WRONG path and changed nothing for this effect.
+- [glowprog]: `curVP=256x256 vpXY=0,0 src=5 dst=6 ab=1 zen=0` -> the effect draws
+  into 6082 with the FULL 256x256 viewport at origin (no offset), blend
+  **SrcAlpha/InvSrcAlpha** (normal alpha, over the white clear), Z off.
+- [clr]: `256x256 color=0xFFFFFFFF rects=0` -> whole buffer cleared opaque white.
+- Clearing that buffer to black/transparent to kill the additive white **breaks the
+  UI** (UI uses the same small white-cleared offscreen buffers, filled opaque). So
+  the white clear is REQUIRED; the fix is NOT the clear.
+- The `EffDSV()` depth guard (never bind scene-size depth to a smaller RT) is kept:
+  it fixed most angles. The remaining white is angle-dependent = the effect's
+  POSITION inside 6082 (its g_matWVP, set by the game) vs where the composite quad
+  samples it. Effect measured earlier at NDC y -0.73..-0.63 (bottom), not centered.
+- **NEXT STEP (the only clean one): capture the COMPOSITE draw's geometry/UVs** (the
+  DrawIndexed(6) additive quad on the backbuffer that samples 6082) — its screen
+  rect + UVs tell whether it expects the effect centered or at NDC, and the Y fix
+  follows deterministically. The effect goes through BeginProgDraw (program path);
+  its g_matWVP is the lever, not anything in the FVF path.
 
-Confirmed by measurement, so it does NOT need to be re-checked:
-- the effect draws reach us (`prog=1`), with a bound texture and a valid SRV,
-- the blend state is correct: `src=SRC_ALPHA dst=ONE`, i.e. additive, which is what
-  the material's `alphablend2` asks for,
-- no draw is lost (`[lost]` stays at zero), no unknown texture format, no failed
-  texture creation, and the scene texture we fill is correct (dumped and inspected:
-  it holds the real scene),
-- `g_matTexture` does arrive, so the projective coordinates have their matrix.
+**USER INSIGHT 2026-08-22 (decisive): it is the HEIGHT, not the angle.** At one
+specific player height in the map the ball renders correctly; at other heights the
+white square. Meaning: the effect draws into 6082 with the SCENE CAMERA, so its
+position in the buffer tracks the player's on-screen Y (= map height). The composite
+samples a FIXED spot, so it only lines up at the height where the effect's buffer Y
+matches. => The fix must make the effect's position in 6082 INDEPENDENT of height
+(centered/fixed), OR match the composite. Two concrete things to check first:
+  1. Is the game setting a height-compensating SetViewport for the offscreen pass
+     that our SetRenderTarget clobbers (it resets curVP to the full RT size)?
+     Log SetViewport + SetRenderTarget order + curVP at the [glowprog] draw for a
+     GOOD height vs a BAD height and diff.
+  2. Log the effect's g_matWVP (the game's matrix) at good vs bad height; the delta
+     is the Y term to neutralize/center.
 
-The same white-square symptom on the wall jump, the dagger and the plasma sword WAS
-fixed, by applying the render states a `.fx` pass declares. These two weapons were not
-fixed by that, so they are a different cause.
+  REFINED: effect cbuffer (matrices) IS uploaded per-pass (effects.cpp UploadCB in
+  BeginPass ~686-694), so the effect uses the game's scene-camera matrix = height-
+  dependent AS INTENDED, same as the original. So the effect is NOT the bug -> the
+  COMPOSITE is: the DrawIndexed(6) additive quad on the backbuffer that samples 6082.
+  In the original it must sample the effect's sub-region (or follow it); ours samples
+  UV 0..1 of the whole buffer, so it only lines up at the one height where the effect
+  sits centered in the buffer. NEXT: capture that composite quad's per-vertex UVs +
+  positions (log the UP/indexed vertex data for the backbuffer draw that binds a
+  256x256 SRV additively) and compare to a UV 0..1 fullscreen assumption.
+
+**Ruled out with evidence — do not re-derive:**
+- `.fx` pass states: the client declares only `FogEnable` (x9) and `AlphaBlendEnable` (x5)
+  across every pass block, and we parse both. Zero `.fx` on disk. Not the dagger fix.
+- The weapon sprite texture is correct (white RGB, shape in the alpha channel).
+- The per-vertex colour arrives: `(0.098, 0.098, 0.247, alpha 0.149)`.
+- The white clear is what the game asks for (`flags=0x1 color=0xFFFFFFFF rects=0`),
+  identical on maps where it works and where it fails.
+- The 512x512 scene texture content is correct (dumped from a capture).
+- `MapBlend` is 1:1 with `D3DBLEND`; the fixed-function cascade and its alpha are complete.
+- Scene texture refresh (107/120 frames on a failing map), bginfo keys (four checked,
+  none splits the list), the glow/haze pass gating from IDA.
+- `g_vEyePos` never arrives — but the `.fx` gives it no default either, so D3DX would also
+  leave it at zero. That is 1:1, not our bug.
+- Orphan interpolants: the VS and PS share the struct, so there are none.
+
+**Fixed along the way (real 1:1 gaps, each independent of this bug):**
+- Blend state leak: with the cache full, `GetBlend` built a new `ID3D11BlendState` per draw
+  and released none — 3.5GB in seconds once `BlendOp` widened the key.
+- `D3DRS_BLENDOP` was hardcoded to `ADD`; the pass state parser already read `BlendOp`.
+- `Clear` ignored the `D3DRECT` list and always cleared the screen depth, not the bound one.
+- `SetDepthStencilSurface(NULL)` bound the screen depth instead of unbinding it.
+- `NTexSurface::UnlockRect` — the client's real texture path — bypassed the crash guard.
+- `ParseDefaults` registered shader LOCALS (`Final`, `tmpPos`, `ShadeColor`...) as uniforms.
+- Entry points were matched as substrings: `PS_DiffuseMap` hit `PS_DiffuseMap_BumpMap_*`.
+- `IsParameterUsed` returned `TRUE` for everything; the engine builds a 29x15 decision
+  table from it (`sub_11D6910`).
+- `GetParameter`/`GetDesc` reported no parameters at all; now 18 for the world shader.
+- **The bump fallback was `0xFFFF8080`, which in BGRA is R=1.0** — and the refraction
+  shader does `BumpMapColor.xy = (tex.xy - 0.5) * 2` and adds it to the projective UV, so
+  we were shifting the refraction lookup by a full 1.0. Corrected to 0.5 grey (zero
+  offset). This is the change that made the glow appear at all.
 
 ### 2. Fog is not visible
 The `_NEFOG` wrapper compiles now (it never did before: the `.fx` input structs have no
