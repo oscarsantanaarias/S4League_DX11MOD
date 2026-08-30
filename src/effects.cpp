@@ -533,6 +533,35 @@ struct MyEffect : public ID3DXEffect {
         }
         return "";
     }
+    static void AddFogMember(std::string& source, const std::string& sname) {
+        size_t p = source.find("struct " + sname);
+        if (p == std::string::npos || source.find("NE_FogDepth", p) != std::string::npos) return;
+        size_t b = source.find('{', p); size_t e = b == std::string::npos ? std::string::npos : source.find('}', b);
+        if (e != std::string::npos) source.insert(e, "  float NE_FogDepth : TEXCOORD7;\n");
+    }
+    std::string WrapVertexFog(const std::string& entry, std::string& source) {
+        std::string out = FuncReturnType(entry);
+        if (out.empty()) return "";
+        size_t p = source.find(entry);
+        if (p == std::string::npos) return "";
+        size_t op = source.find('(', p), cp = op == std::string::npos ? std::string::npos : source.find(')', op);
+        if (cp == std::string::npos) return "";
+        std::string args = source.substr(op + 1, cp - op - 1);
+        size_t a = args.find_last_not_of(" \t\r\n");
+        size_t q = a == std::string::npos ? std::string::npos : args.rfind(' ', a);
+        if (q == std::string::npos) return "";
+        std::string arg = args.substr(q + 1, a - q);
+        std::string ret = out;
+        std::string pos = PositionMember(out);
+        if (pos.empty() || arg.empty()) return "";
+        AddFogMember(source, out);
+        source.replace(p, entry.size(), entry + "_NEORIG");
+        source += "\n" + ret + " " + entry + "(" + args + ") {\n"
+                  "  " + ret + " o = " + entry + "_NEORIG(" + arg + ");\n"
+                  "  o.NE_FogDepth = o." + pos + ".w;\n"
+                  "  return o;\n}\n";
+        return entry;
+    }
     // The fog constants live in their own cbuffer at b1, NOT in $Globals (b0). The
     // effect's cbuffer is uploaded once per BeginPass, but the game toggles FOGENABLE
     // per object, so reading it there gave the wrong answer and the previous code had
@@ -540,16 +569,11 @@ struct MyEffect : public ID3DXEffect {
     // why the whole wrapper ended up disabled. b1 is refilled on every draw by the
     // backend, so each object gets its own real enable.
     std::string FogWrapper(const std::string& entry, const std::string& sname) {
-        // Depth comes from the struct member that already carries POSITION, whatever
-        // it is called. Under backwards compatibility that semantic maps to
-        // SV_Position, whose .w holds 1/w, so the view depth is its reciprocal.
-        std::string pos = PositionMember(sname);
-        if (pos.empty()) return "";   // no depth to read: no fog wrapper, alpha test still applies
         return "\ncbuffer NE_FogCB : register(b1) { float4 g_NE_Fog; float4 g_NE_FogColor; };\n"
                "float4 " + entry + "_NEFOG(" + sname + " In) : COLOR {\n"
                "  float4 c = " + entry + "_NEAT(In);\n"
                "  if (g_NE_Fog.z > 0.5) {\n"
-               "    float d = 1.0 / max(In." + pos + ".w, 1e-8);   // POSITION maps to SV_Position, .w is 1/w\n"
+               "    float d = In.NE_FogDepth;\n"
                "    float f = saturate((g_NE_Fog.y - d) / max(g_NE_Fog.y - g_NE_Fog.x, 0.001));\n"
                "    c.rgb = lerp(g_NE_FogColor.rgb, c.rgb, f);\n  }\n"
                "  return c;\n}\n";
@@ -572,12 +596,14 @@ struct MyEffect : public ID3DXEffect {
         }
         std::string use = hlsl; std::string ent = entry;
         std::string atOnly; // intermediate level: alpha test only
+        if (isVS) WrapVertexFog(entry, use);
         if (!isVS) {
             atStruct.clear();
             std::string w = AlphaTestWrapper(entry, vsEntry);
             if (!w.empty()) {
                 atOnly = hlsl + w; use = atOnly; ent = entry + "_NEAT";
                 if (!atStruct.empty()) {
+                    AddFogMember(atOnly, atStruct);
                     std::string fw = FogWrapper(entry, atStruct);
                     if (!fw.empty()) { use = atOnly + fw; ent = entry + "_NEFOG"; }
                 }
