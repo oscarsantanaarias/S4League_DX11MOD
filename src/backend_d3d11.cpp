@@ -1370,7 +1370,10 @@ struct NDevice : Unk<IDirect3DDevice9> {
             struct { float fog[4]; float color[4]; } fc{};
             memcpy(&fc.fog[0], &rs[D3DRS_FOGSTART], 4);
             memcpy(&fc.fog[1], &rs[D3DRS_FOGEND], 4);
-            fc.fog[2] = rs[D3DRS_FOGENABLE] ? 1.f : 0.f;
+            float fogStart = fc.fog[0], fogEnd = fc.fog[1];
+            bool mapFog = fogEnd > fogStart && fogEnd > 1.f;
+            bool is2D = (cb.isRHW > 0.5f);
+            fc.fog[2] = (!is2D && (mapFog || rs[D3DRS_FOGENABLE])) ? 1.f : 0.f;
             DWORD color = rs[D3DRS_FOGCOLOR];
             fc.color[0] = ((color >> 16) & 0xFF) / 255.f;
             fc.color[1] = ((color >> 8) & 0xFF) / 255.f;
