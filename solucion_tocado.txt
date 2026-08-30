@@ -73,22 +73,3 @@ Nota de prueba
 --------------
 En esta pasada no se ejecuto C:\S4League\run.bat. El archivo dx11.asi queda listo para
 probar el mismo angulo/altura donde aparecia el cuadro.
-
-FOG DEL MAPA
-------------
-Los archivos C:\S4League\extracted_resources\resources\mapinfo\*.ini definen el fog
-en la seccion [RENDERER], con FogMinDist, FogMaxDist y FogColorR/G/B. No es un efecto
-SCN ni una textura del mapa.
-
-Ghidra confirma que CFogPropertyCommand llama a la aplicacion de estados con:
-  0x23 = FOGTABLEMODE (linear)
-  0x22 = FOGCOLOR
-  0x24 = FOGSTART
-  0x25 = FOGEND
-
-Archivo cambiado: C:\NativeEngine\src\effects.cpp
-El vertex shader agrega NE_FogDepth en TEXCOORD7 usando su POSITION.w. El pixel shader
-usa ese valor para mezclar el color del mapa con FogStart/FogEnd. FOGENABLE sigue siendo
-por objeto, por lo que la UI y los efectos que lo desactivan no reciben fog.
-
-No se forzo FOGENABLE globalmente y no se ejecuto el juego en esta pasada.
