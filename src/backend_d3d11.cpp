@@ -468,7 +468,6 @@ static const char* kDefaultHLSL = R"(
 cbuffer C : register(b0) { float4x4 gWorld; float4x4 gView; float4x4 gProj; float vpW; float vpH; float hasTex; float isRHW;
                            float hasCol; float p0; float p1; float p2;
                            float4 stageC[4]; float4 stageA[4]; float4 gTFactor; };
-cbuffer Fog : register(b1) { float4 gFog; float4 gFogColor; };
 Texture2D tex0 : register(t0);
 Texture2D tex1 : register(t1);
 Texture2D tex2 : register(t2);
@@ -478,7 +477,7 @@ SamplerState s1 : register(s1);
 SamplerState s2 : register(s2);
 SamplerState s3 : register(s3);
 struct VSIn  { float4 pos : POSITION; float4 col : COLOR0; float2 uv0 : TEXCOORD0; float2 uv1 : TEXCOORD1; float2 uv2 : TEXCOORD2; float2 uv3 : TEXCOORD3; };
-struct VSOut { float4 pos : SV_POSITION; float4 col : COLOR0; float2 uv0 : TEXCOORD0; float2 uv1 : TEXCOORD1; float2 uv2 : TEXCOORD2; float2 uv3 : TEXCOORD3; float fogDepth : TEXCOORD7; };
+struct VSOut { float4 pos : SV_POSITION; float4 col : COLOR0; float2 uv0 : TEXCOORD0; float2 uv1 : TEXCOORD1; float2 uv2 : TEXCOORD2; float2 uv3 : TEXCOORD3; };
 VSOut VS(VSIn i) {
     VSOut o;
     if (isRHW > 0.5) {
@@ -492,7 +491,6 @@ VSOut VS(VSIn i) {
     // If the FVF does NOT carry DIFFUSE we still declare a COLOR0 (the VS requires it)
     // but it points at offset 0 = the POSITION: reading it would give garbage and saturate to white.
     o.col = (hasCol > 0.5) ? i.col : float4(1,1,1,1);
-    o.fogDepth = (isRHW > 0.5) ? 0.0 : o.pos.w;
     o.uv0 = i.uv0; o.uv1 = i.uv1; o.uv2 = i.uv2; o.uv3 = i.uv3;
     return o;
 }
@@ -549,10 +547,6 @@ float4 PS(VSOut i) : SV_Target {
         if (p1 < 0.5) { if (cur.a <  p0) discard; }   // GREATER / GREATEREQUAL
         else          { if (cur.a >= p0) discard; }   // LESS / LESSEQUAL
     }
-    if (gFog.z > 0.5 && i.fogDepth > 0.0) {
-        float f = saturate((gFog.y - i.fogDepth) / max(gFog.y - gFog.x, 0.001));
-        cur.rgb = lerp(gFogColor.rgb, cur.rgb, f);
-    }
     return cur;
 }
 // Variant for the .fx passes that declare PixelShader = null (projected shadow,
@@ -563,7 +557,6 @@ float4 PS1(VSOut1 i) : SV_Target {
     VSOut o;
     o.pos = i.pos; o.col = i.col;
     o.uv0 = i.uv0; o.uv1 = i.uv0; o.uv2 = i.uv0; o.uv3 = i.uv0;
-    o.fogDepth = 0.0;
     return PS(o);
 }
 )";
@@ -1333,21 +1326,6 @@ struct NDevice : Unk<IDirect3DDevice9> {
         if (rs[D3DRS_ALPHABLENDENABLE]) g.ctx->OMSetBlendState(GetBlend(rs[D3DRS_SRCBLEND], rs[D3DRS_DESTBLEND], rs[D3DRS_BLENDOP]), bf, 0xffffffff);
         else g.ctx->OMSetBlendState(nullptr, bf, 0xffffffff);
         g.ctx->PSSetSamplers(0, 1, &g.samp);
-        if (g.fogCB) {
-            struct { float fog[4]; float col[4]; } fc{};
-            memcpy(&fc.fog[0], &rs[D3DRS_FOGSTART], 4);
-            memcpy(&fc.fog[1], &rs[D3DRS_FOGEND], 4);
-            fc.fog[2] = rs[D3DRS_FOGENABLE] ? 1.f : 0.f;
-            DWORD c = rs[D3DRS_FOGCOLOR];
-            fc.col[0] = ((c >> 16) & 0xFF) / 255.f;
-            fc.col[1] = ((c >> 8) & 0xFF) / 255.f;
-            fc.col[2] = (c & 0xFF) / 255.f; fc.col[3] = 1.f;
-            D3D11_MAPPED_SUBRESOURCE fm{};
-            if (SUCCEEDED(g.ctx->Map(g.fogCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &fm))) {
-                memcpy(fm.pData, &fc, sizeof(fc)); g.ctx->Unmap(g.fogCB, 0);
-            }
-            g.ctx->PSSetConstantBuffers(1, 1, &g.fogCB);
-        }
         // "White" TEST: if forcing opaque makes it disappear, there is an ADDITIVE pass on top.
         CBData cb{};
         memcpy(cb.world, &mWorld, 64); memcpy(cb.view, &mView, 64); memcpy(cb.proj, &mProj, 64);

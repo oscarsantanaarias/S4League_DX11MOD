@@ -73,14 +73,3 @@ Nota de prueba
 --------------
 En esta pasada no se ejecuto C:\S4League\run.bat. El archivo dx11.asi queda listo para
 probar el mismo angulo/altura donde aparecia el cuadro.
-
-FOG DEL MAPA
-------------
-Station 2 carga el fog desde [RENDERER]: FogMinDist=2000, FogMaxDist=15000 y
-FogColor=(0.2, 0.55, 1.0). Ghidra muestra que CFog_D3D recibe esos valores mediante
-ChangeFogProperty/RestoreFogProperty y los aplica desde FUN_0117D5A0.
-
-Archivo cambiado: C:\NativeEngine\src\backend_d3d11.cpp
-La ruta fixed-function sube FOGSTART, FOGEND, FOGCOLOR y FOGENABLE al cbuffer del shader.
-La profundidad se conserva desde el vertex shader para calcular fog lineal. XYZRHW no
-recibe fog, por lo que la UI queda fuera de esta ruta.
