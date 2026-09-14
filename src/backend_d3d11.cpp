@@ -16,7 +16,9 @@
 #include <d3d11.h>
 #include <d3d11_1.h>   // ID3D11DeviceContext1::ClearView, for D3D9 rectangle clears
 #include <d3d11sdklayers.h>
+#include <dxgi1_5.h>
 #include <d3dcompiler.h>
+#include <intrin.h>
 #undef GetMessage
 #include <cstdint>
 #include <cstring>
@@ -31,6 +33,8 @@
 #pragma comment(lib, "d3dcompiler.lib")
 
 namespace ne {
+
+void NE_FogState(float* fog4, float* color4);
 
 LONG GuardCalls();          // guards.cpp: how many times per frame the game enters the guards
 LONG PoolDestroySkipped();  // guards.cpp: pool elements that were garbage and we refused to destroy
@@ -197,6 +201,7 @@ struct Gpu {
     ID3D11Device* dev = nullptr;
     ID3D11DeviceContext* ctx = nullptr;
     IDXGISwapChain* sc = nullptr;
+    bool tearingSupported = false;
     ID3D11RenderTargetView* rtv = nullptr;      // backbuffer
     ID3D11RenderTargetView* curRTV = nullptr;   // CURRENT render target (backbuffer or texture)
     ID3D11DepthStencilView* curDSV = nullptr;   // CURRENT depth
@@ -219,6 +224,26 @@ struct Gpu {
     ID3D11Buffer* fogCB = nullptr;   // PER-DRAW fog (b1), not per BeginPass
     ID3D11InfoQueue* iq = nullptr;
     UINT bbW = 0, bbH = 0;
+    // Enemy/character outline (F3 toggles it): a single-channel mask, backbuffer-sized,
+    // that every skinned draw also writes a white silhouette into (same depth test as
+    // the real draw, so it is naturally occluded by walls -- no extra logic needed for
+    // "hides behind walls"). Composited onto the backbuffer in Present() as a colored
+    // ring around the mask's edges, then cleared for the next frame.
+    ID3D11Texture2D* outlineTex = nullptr;
+    ID3D11RenderTargetView* outlineRTV = nullptr;
+    ID3D11ShaderResourceView* outlineSRV = nullptr;
+
+    // MSAA: g.rtv/the swapchain buffer stays single-sample (FLIP_DISCARD requires it --
+    // DXGI does not allow a multisampled swapchain backbuffer). The game's own draws go
+    // to g.msaaRTV instead (same role g.rtv used to play for "curRTV == the main scene"),
+    // and Present() resolves it into the real backbuffer, in bbTex, right before
+    // compositing the outline and presenting. bbTex is the raw texture behind g.rtv,
+    // kept alive as the resolve destination -- the old code released it immediately
+    // after creating the view, which was fine when nothing needed the texture itself.
+    ID3D11Texture2D* bbTex = nullptr;
+    ID3D11Texture2D* msaaTex = nullptr;
+    ID3D11RenderTargetView* msaaRTV = nullptr;
+    UINT msaaSamples = 1;
 } g;
 
 static ID3D11RasterizerState* GetRasterizer(float bias, float slope, DWORD cull, DWORD fill) {
@@ -270,7 +295,7 @@ static ID3D11SamplerState* GetSampler(DWORD u, DWORD v, DWORD w, DWORD minF, DWO
 // stageC[i] = (COLOROP, COLORARG1, COLORARG2, thereIsATextureInTheStage)
 // stageA[i] = (ALPHAOP, ALPHAARG1, ALPHAARG2, isA8)
 struct CBData { float world[16]; float view[16]; float proj[16]; float vpW, vpH, hasTex, isRHW; float hasCol, pad0, pad1, pad2;
-                float stageC[4][4]; float stageA[4][4]; float tfactor[4]; };
+                float stageC[4][4]; float stageA[4][4]; float tfactor[4]; float fog[4]; float fogColor[4]; };
 
 // Render states declared by the .fx pass currently bound. They override the device
 // state for that pass's draws only, and are dropped with the program, so they never
@@ -279,7 +304,187 @@ static DWORD g_passState[16], g_passValue[16];
 static int g_passStateCount = 0;
 
 // ---- active program (the effect sets it before each draw) + input layouts ----
-struct Program { ID3D11VertexShader* vs = nullptr; ID3D11PixelShader* ps = nullptr; const void* vsbc = nullptr; SIZE_T vslen = 0; bool active = false; } g_prog;
+struct Program { ID3D11VertexShader* vs = nullptr; ID3D11PixelShader* ps = nullptr; const void* vsbc = nullptr; SIZE_T vslen = 0; bool active = false; bool isSkinned = false; } g_prog;
+
+// ---- character outline (F3) ----
+// Everything Gpu/BuildBlit/g_prog-related this needs (g, g_blitVS, g_prog...) is
+// already declared above this point in the file; earlier placements of this block
+// (right by BuildBlit, near the top) predate all three and do not compile.
+static bool g_outlineEnabled = false;
+static ID3D11PixelShader* g_maskWhitePS = nullptr;
+static ID3D11PixelShader* g_outlinePS = nullptr;
+static ID3D11BlendState* g_outlineBlend = nullptr;
+static ID3D11Buffer* g_outlineCB = nullptr;
+static const char* kMaskHLSL =
+    "float4 PSMask(float4 p : SV_Position) : SV_Target { return float4(1,1,1,1); }";
+// Ring test: the composite quad checks 8 neighbors at `thickness` pixels; a fragment
+// outside the silhouette (mask<0.5) with any filled neighbor is the border -> red.
+// Inside the silhouette this outputs nothing -- the real character was already drawn,
+// correctly lit, straight into the backbuffer earlier in the frame; this only ADDS
+// the ring around it, it never repaints the character.
+static const char* kOutlineCompositeHLSL = R"(
+Texture2D mask : register(t0); SamplerState samp : register(s0);
+cbuffer CB : register(b0) { float2 texel; float thickness; float pad0; }
+struct V { float4 p : SV_Position; float2 uv : TEXCOORD0; };
+float4 PSOutlineComposite(V i) : SV_Target {
+    if (mask.Sample(samp, i.uv).r > 0.5) return float4(0,0,0,0);
+    float m = 0;
+    [unroll] for (int k = 0; k < 8; k++) {
+        float ang = k * 0.7853981634;
+        float2 o = float2(cos(ang), sin(ang)) * thickness * texel;
+        m = max(m, mask.Sample(samp, i.uv + o).r);
+    }
+    return (m > 0.5) ? float4(1,0,0,1) : float4(0,0,0,0);
+}
+)";
+static bool BuildOutlinePipeline(ID3D11Device* dev) {
+    if (g_outlinePS) return true;
+    ID3DBlob* mb = nullptr; ID3DBlob* ob = nullptr; ID3DBlob* er = nullptr;
+    if (FAILED(D3DCompile(kMaskHLSL, strlen(kMaskHLSL), "mask", nullptr, nullptr, "PSMask", "ps_4_0", 0, 0, &mb, &er))) {
+        if (er) { Log("[outline] mask PS compile fail: %s\n", (char*)er->GetBufferPointer()); er->Release(); }
+        return false;
+    }
+    dev->CreatePixelShader(mb->GetBufferPointer(), mb->GetBufferSize(), nullptr, &g_maskWhitePS);
+    mb->Release();
+    if (FAILED(D3DCompile(kOutlineCompositeHLSL, strlen(kOutlineCompositeHLSL), "outline", nullptr, nullptr,
+                          "PSOutlineComposite", "ps_4_0", 0, 0, &ob, &er))) {
+        if (er) { Log("[outline] composite PS compile fail: %s\n", (char*)er->GetBufferPointer()); er->Release(); }
+        return false;
+    }
+    dev->CreatePixelShader(ob->GetBufferPointer(), ob->GetBufferSize(), nullptr, &g_outlinePS);
+    ob->Release();
+    D3D11_BLEND_DESC bd{}; bd.RenderTarget[0].BlendEnable = TRUE;
+    bd.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC_ALPHA; bd.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+    bd.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+    bd.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE; bd.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ZERO;
+    bd.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+    bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+    dev->CreateBlendState(&bd, &g_outlineBlend);
+    D3D11_BUFFER_DESC cbd{}; cbd.ByteWidth = 16; cbd.Usage = D3D11_USAGE_DYNAMIC;
+    cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER; cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    dev->CreateBuffer(&cbd, nullptr, &g_outlineCB);
+    return g_outlinePS && g_maskWhitePS;
+}
+// (Re)creates the mask target at the current backbuffer size. Called on device init
+// and on every Reset() that changes resolution, right alongside g.dsv.
+// Picks the highest of {8,4,2} the device actually supports for a BGRA8 render target
+// at that sample count, falling back to msaaRTV == g.rtv (no MSAA) if even 2x reports no
+// valid quality level -- seen on some software/RDP adapters, never on real hardware, but
+// cheap to guard rather than assume.
+static inline ID3D11RenderTargetView* MainSceneRTV() { return g.msaaSamples > 1 ? g.msaaRTV : g.rtv; }
+static void CreateMSAATargets(UINT w, UINT h) {
+    if (g.msaaRTV) { g.msaaRTV->Release(); g.msaaRTV = nullptr; }
+    if (g.msaaTex) { g.msaaTex->Release(); g.msaaTex = nullptr; }
+    if (!g.dev || !w || !h) { g.msaaSamples = 1; return; }
+
+    // NE_MSAA=0/1/2/4/8 overrides the auto-picked sample count, to A/B the FPS cost
+    // of MSAA itself against the wrapper's own per-draw overhead without recompiling.
+    static int override_ = -1;
+    if (override_ < 0) {
+        char b[8] = "";
+        override_ = GetEnvironmentVariableA("NE_MSAA", b, sizeof(b)) ? atoi(b) : -1;
+    }
+    if (override_ == 0 || override_ == 1) { g.msaaSamples = 1; Log("[ne] MSAA forced off (NE_MSAA=%d)\n", override_); return; }
+
+    UINT samples = 1, quality = 0;
+    UINT candidates3[3] = { 8u, 4u, 2u };
+    UINT candidatesOverride[1] = { (UINT)override_ };
+    UINT* candList = override_ > 1 ? candidatesOverride : candidates3;
+    int candCount = override_ > 1 ? 1 : 3;
+    for (int ci = 0; ci < candCount; ++ci) {
+        UINT candidate = candList[ci];
+        UINT q = 0;
+        if (SUCCEEDED(g.dev->CheckMultisampleQualityLevels(DXGI_FORMAT_B8G8R8A8_UNORM, candidate, &q)) && q > 0) {
+            samples = candidate; quality = 0; break;
+        }
+    }
+    g.msaaSamples = samples;
+    if (samples <= 1) { Log("[ne] MSAA not supported for this format, running without it\n"); return; }
+
+    D3D11_TEXTURE2D_DESC dd{}; dd.Width = w; dd.Height = h; dd.MipLevels = 1; dd.ArraySize = 1;
+    dd.Format = DXGI_FORMAT_B8G8R8A8_UNORM; dd.SampleDesc.Count = samples; dd.SampleDesc.Quality = quality;
+    dd.Usage = D3D11_USAGE_DEFAULT; dd.BindFlags = D3D11_BIND_RENDER_TARGET;
+    if (SUCCEEDED(g.dev->CreateTexture2D(&dd, nullptr, &g.msaaTex)) && g.msaaTex) {
+        g.dev->CreateRenderTargetView(g.msaaTex, nullptr, &g.msaaRTV);
+        Log("[ne] MSAA %ux at %ux%u\n", samples, w, h);
+    } else {
+        g.msaaSamples = 1;
+    }
+}
+
+static void CreateOutlineTarget(UINT w, UINT h) {
+    if (g.outlineRTV) { g.outlineRTV->Release(); g.outlineRTV = nullptr; }
+    if (g.outlineSRV) { g.outlineSRV->Release(); g.outlineSRV = nullptr; }
+    if (g.outlineTex) { g.outlineTex->Release(); g.outlineTex = nullptr; }
+    if (!g.dev || !w || !h) return;
+    D3D11_TEXTURE2D_DESC dd{}; dd.Width = w; dd.Height = h; dd.MipLevels = 1; dd.ArraySize = 1;
+    dd.Format = DXGI_FORMAT_R8_UNORM; dd.SampleDesc.Count = 1; dd.Usage = D3D11_USAGE_DEFAULT;
+    dd.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    if (SUCCEEDED(g.dev->CreateTexture2D(&dd, nullptr, &g.outlineTex)) && g.outlineTex) {
+        g.dev->CreateRenderTargetView(g.outlineTex, nullptr, &g.outlineRTV);
+        g.dev->CreateShaderResourceView(g.outlineTex, nullptr, &g.outlineSRV);
+    }
+}
+// Same rule NDevice::EffDSV() uses (a private member there, so re-stated here for a
+// free function): only the backbuffer's own depth view matches g.dsv when a non-
+// backbuffer target is bound -- using it against an offscreen RT of a different size
+// is what burned the glow buffers white, elsewhere in this file.
+static ID3D11DepthStencilView* OutlineEffDSV() {
+    return (g.curDSV == g.dsv && g.curRTV != MainSceneRTV()) ? nullptr : g.curDSV;
+}
+// Re-draws the just-issued geometry into the mask, solid white, testing (not writing)
+// against the SAME depth the real draw just wrote -- LEQUAL means the identical depth
+// value passes, so the silhouette only appears where the character is actually visible
+// this frame; whatever already occludes it (walls, other players) blocks it exactly
+// the same way it blocks the real draw. Restores PS/render targets afterward so
+// nothing else notices this ran.
+static void DrawOutlineMaskCopy(bool indexed, UINT count, UINT startOrIdx, INT baseV) {
+    if (!g_outlineEnabled || !g_prog.isSkinned || !g.outlineRTV || !g.ctx) return;
+    if (!BuildOutlinePipeline(g.dev)) return;
+    ID3D11RenderTargetView* rtv = g.outlineRTV;
+    g.ctx->OMSetRenderTargets(1, &rtv, OutlineEffDSV());
+    g.ctx->OMSetDepthStencilState(g.dsNoWrite, 0);
+    float bf[4] = { 0,0,0,0 };
+    g.ctx->OMSetBlendState(nullptr, bf, 0xffffffff);
+    g.ctx->PSSetShader(g_maskWhitePS, nullptr, 0);
+    if (indexed) g.ctx->DrawIndexed(count, startOrIdx, baseV);
+    else g.ctx->Draw(count, startOrIdx);
+    g.ctx->PSSetShader(g_prog.ps, nullptr, 0);
+    g.ctx->OMSetRenderTargets(1, &g.curRTV, OutlineEffDSV());
+}
+// Composites the accumulated mask onto the real backbuffer (colored ring at the
+// silhouette edges) and clears the mask for the next frame. Called once per frame from
+// Present(), right before the actual swapchain Present -- by then the whole scene is
+// already sitting in g.rtv, which is exactly what needs to be composited over.
+static void CompositeOutline() {
+    if (!g_outlineEnabled || !g.outlineSRV || !g.rtv || !g.ctx) return;
+    if (!BuildBlit(g.dev) || !BuildOutlinePipeline(g.dev)) return;
+    D3D11_MAPPED_SUBRESOURCE m{};
+    if (SUCCEEDED(g.ctx->Map(g_outlineCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+        float cb[4] = { g.bbW ? 1.0f / g.bbW : 0.f, g.bbH ? 1.0f / g.bbH : 0.f, 3.0f, 0.f };
+        memcpy(m.pData, cb, sizeof(cb));
+        g.ctx->Unmap(g_outlineCB, 0);
+    }
+    g.ctx->OMSetRenderTargets(1, &g.rtv, nullptr);
+    D3D11_VIEWPORT vp{}; vp.Width = (float)g.bbW; vp.Height = (float)g.bbH; vp.MaxDepth = 1.f;
+    g.ctx->RSSetViewports(1, &vp);
+    g.ctx->IASetInputLayout(nullptr);
+    g.ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    g.ctx->VSSetShader(g_blitVS, nullptr, 0);
+    g.ctx->PSSetShader(g_outlinePS, nullptr, 0);
+    g.ctx->PSSetShaderResources(0, 1, &g.outlineSRV);
+    g.ctx->PSSetSamplers(0, 1, &g_blitSamp);
+    g.ctx->PSSetConstantBuffers(0, 1, &g_outlineCB);
+    float bf[4] = { 0,0,0,0 };
+    g.ctx->OMSetBlendState(g_outlineBlend, bf, 0xffffffff);
+    g.ctx->OMSetDepthStencilState(g.dsOff, 0);
+    g.ctx->Draw(3, 0);
+    ID3D11ShaderResourceView* nul = nullptr; g.ctx->PSSetShaderResources(0, 1, &nul);
+    float clr[4] = { 0,0,0,0 };
+    g.ctx->ClearRenderTargetView(g.outlineRTV, clr);
+    g.ctx->OMSetRenderTargets(1, &g.curRTV, OutlineEffDSV());
+}
+
 // diagnostic counters
 static ID3D11Texture2D* g_sceneTex = nullptr;
 static ID3D11ShaderResourceView* g_sceneSRV = nullptr;
@@ -288,6 +493,8 @@ static ID3D11ShaderResourceView* g_sceneSRV = nullptr;
 // programmable draw after binding that target may neutralize the clear alpha.
 static bool g_effectTargetNeedsAlphaClear = false;
 static LONG dbg_IUP = 0;
+static float g_fogMap[5] = {};
+static volatile LONG g_fogMapValid = 0;
 // draws the game asked for and we did NOT execute, by reason
 static LONG dbg_skipVS = 0, dbg_skipFVF = 0, dbg_skipBuf = 0, dbg_skipProg = 0;
 // The per-map FullSceneGlow weights, in thousandths. CBgInfo_ParseRendererSection
@@ -467,7 +674,8 @@ static UINT FvfStride(DWORD fvf) {
 static const char* kDefaultHLSL = R"(
 cbuffer C : register(b0) { float4x4 gWorld; float4x4 gView; float4x4 gProj; float vpW; float vpH; float hasTex; float isRHW;
                            float hasCol; float p0; float p1; float p2;
-                           float4 stageC[4]; float4 stageA[4]; float4 gTFactor; };
+                           float4 stageC[4]; float4 stageA[4]; float4 gTFactor;
+                           float4 gFog; float4 gFogColor; };
 Texture2D tex0 : register(t0);
 Texture2D tex1 : register(t1);
 Texture2D tex2 : register(t2);
@@ -514,7 +722,15 @@ float4 TexOp(float o, float4 a1, float4 a2) {
     if (o < 9.5) return saturate((a1 + a2 - 0.5) * 2.0);
     return saturate(a1 - a2);
 }
-float4 PS(VSOut i) : SV_Target {
+float4 ApplyFog(float4 c, float4 pos, float rhw) {
+    if (rhw < 0.5 && gFog.z > 0.5) {
+        float d = 1.0 / max(pos.w, 1e-8);
+        float f = saturate((gFog.y - d) / max(gFog.y - gFog.x, 0.001));
+        c.rgb = lerp(gFogColor.rgb, c.rgb, f);
+    }
+    return c;
+}
+float4 PSCore(VSOut i, float rhw) {
     float4 diff = i.col;
     float4 cur = diff;   // at stage 0, CURRENT == DIFFUSE
     [unroll] for (int st = 0; st < 4; ++st) {
@@ -547,8 +763,9 @@ float4 PS(VSOut i) : SV_Target {
         if (p1 < 0.5) { if (cur.a <  p0) discard; }   // GREATER / GREATEREQUAL
         else          { if (cur.a >= p0) discard; }   // LESS / LESSEQUAL
     }
-    return cur;
+    return ApplyFog(cur, i.pos, rhw);
 }
+float4 PS(VSOut i) : SV_Target { return PSCore(i, isRHW); }
 // Variant for the .fx passes that declare PixelShader = null (projected shadow,
 // TextureNoise): the vertex shader is supplied by the effect and only outputs
 // COLOR0 + TEXCOORD0, so the PS cannot ask for more texcoords than that.
@@ -557,7 +774,7 @@ float4 PS1(VSOut1 i) : SV_Target {
     VSOut o;
     o.pos = i.pos; o.col = i.col;
     o.uv0 = i.uv0; o.uv1 = i.uv0; o.uv2 = i.uv0; o.uv3 = i.uv0;
-    return PS(o);
+    return PSCore(o, 1.0);
 }
 )";
 
@@ -839,6 +1056,11 @@ static BYTE* TexAlloc(size_t sz) {
     if (p) g_shadowKB += (LONG)((sz + 8192) / 1024);
     return p;
 }
+static void TexFree(BYTE* p, size_t sz) {
+    if (!p || (uintptr_t)p < 0x10000) return;
+    free(p);
+    g_shadowKB -= (LONG)((sz + 8192) / 1024);
+}
 // The driver (nvwgf2um) was AVing reading address 1 inside UpdateSubresource when
 // entering a channel. Before uploading we check that the source is readable and of
 // the size we claim; if not, the upload is skipped instead of killing the client.
@@ -939,7 +1161,10 @@ struct NTexture : Unk<IDirect3DTexture9> {
         }
     }
     ID3D11DepthStencilView* dsv = nullptr;
-    ~NTexture() { if (rtv) rtv->Release(); if (dsv) dsv->Release(); if (srv) srv->Release(); if (tex) tex->Release(); } // DIAG: shadow has a guard page, it is not freed
+    ~NTexture() {
+        if (rtv) rtv->Release(); if (dsv) dsv->Release(); if (srv) srv->Release(); if (tex) tex->Release();
+        for (UINT l = 0; l < levels; ++l) TexFree(shadow[l], LevelSize(l));
+    }
     STDMETHOD(GetDevice)(IDirect3DDevice9** d) { *d = g_dev9; if (g_dev9) g_dev9->AddRef(); return D3D_OK; }
     STDMETHOD(SetPrivateData)(REFGUID, const void*, DWORD, DWORD) { return D3D_OK; }
     STDMETHOD(GetPrivateData)(REFGUID, void*, DWORD*) { return D3D_OK; }
@@ -991,6 +1216,7 @@ struct NTexture : Unk<IDirect3DTexture9> {
         if (base && !SrcReadable(base, LevelSize(lvl))) {
             static LONG n = 0; if (InterlockedIncrement(&n) <= 8)
                 Log("[ne] unreadable shadow %ux%u lvl=%u ptr=%p -> reallocated\n", w, h, lvl, base);
+            TexFree(base, LevelSize(lvl));
             base = shadow[lvl] = TexAlloc(LevelSize(lvl));   // last resort: loses the glyphs already drawn
         }
         if (!base) { base = shadow[lvl] = TexAlloc(LevelSize(lvl)); } // realloc: freed after uploading
@@ -1101,6 +1327,37 @@ struct NTexture : Unk<IDirect3DTexture9> {
 static void NE_TexLevelFilled(NTexture* t, UINT lvl) {
     if (!t || lvl + 1 <= t->filled) return;
     t->filled = lvl + 1; t->RefreshSRV();
+}
+// Almost every map's light ramp is a 256x1 (or 256x2) strip, which is what the ramp
+// latch below keys on -- except indoorlight02.dds, which is the SAME kind of ramp
+// (a horizontal gradient) but stored as a wasteful 256x256 DXT1 square, so it never
+// matched the h<=2 check and this map's lighting kept flickering.
+// Can't key on the filename (this D3D9 layer never sees the file path, only the
+// created D3D11 texture), so this checks the actual pixel content instead: sample the
+// BC1 endpoint colour at a few x-positions across the top/middle/bottom rows -- a real
+// horizontal ramp repeats the same row all the way down, while an ordinary 256x256
+// lightmap/texture (also seen at stage 1) varies well beyond DXT1's own quantisation
+// noise between rows.
+static bool NE_LooksLikeSquareRamp(NTexture* n) {
+    if (!n || !n->shadow[0] || !n->comp || n->blk != 8 || n->w != 256 || n->h != 256) return false;
+    UINT pitch = n->RowPitch(0); // bytes per row of 4x4 blocks
+    const BYTE* data = n->shadow[0];
+    auto color0At = [&](UINT row, UINT blockCol) -> WORD {
+        const BYTE* p = data + (row / 4) * pitch + (size_t)blockCol * 8;
+        return (WORD)(p[0] | (p[1] << 8));
+    };
+    auto close = [](WORD a, WORD b) {
+        int dr = (int)((a >> 11) & 0x1F) - (int)((b >> 11) & 0x1F);
+        int dg = (int)((a >> 5) & 0x3F) - (int)((b >> 5) & 0x3F);
+        int db = (int)(a & 0x1F) - (int)(b & 0x1F);
+        return abs(dr) <= 1 && abs(dg) <= 2 && abs(db) <= 1;
+    };
+    const UINT cols[3] = { 0, 32, 63 };
+    for (UINT c : cols) {
+        WORD top = color0At(0, c), mid = color0At(128, c), bot = color0At(252, c);
+        if (!close(top, mid) || !close(top, bot)) return false;
+    }
+    return true;
 }
 struct NVDecl : Unk<IDirect3DVertexDeclaration9> {
     D3DVERTEXELEMENT9 el[32]; UINT n = 0;
@@ -1231,11 +1488,15 @@ struct NDevice : Unk<IDirect3DDevice9> {
     DWORD ss[8][14] = {};   // sampler states (ADDRESSU/V/W, MAG/MIN/MIPFILTER)
     D3DMATRIX mWorld, mView, mProj; // fixed-function transforms (SetTransform)
     D3DVIEWPORT9 curVP{}; // current viewport (for the character preview inside its box)
+    CBData lastDefaultCB{};
+    bool defaultCBValid = false;
 
     UINT syncInterval = 1;   // D3DPRESENT_INTERVAL_IMMEDIATE -> 0 (no vsync)
     void SetSync(D3DPRESENT_PARAMETERS* pp) {
         if (!pp) return;
         syncInterval = (pp->PresentationInterval == D3DPRESENT_INTERVAL_IMMEDIATE) ? 0u : 1u;
+        char e[8] = {};
+        if (GetEnvironmentVariableA("NE_NOVSYNC", e, sizeof(e)) && e[0] == '1') syncInterval = 0;
         Log("[ne] PresentationInterval=0x%X -> SyncInterval=%u\n", pp->PresentationInterval, syncInterval);
     }
     NDevice(IDirect3D9* p, HWND h, D3DPRESENT_PARAMETERS* pp) : parent(p), hwnd(h) {
@@ -1253,6 +1514,28 @@ struct NDevice : Unk<IDirect3DDevice9> {
         // every Present serializes against the previous frame and the fps sink even
         // though the scene is ~160 draws. FLIP_DISCARD also avoids the DWM copy.
         sd.SampleDesc.Count = 1; sd.Windowed = TRUE; sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+        // A windowed FLIP_DISCARD swapchain is still vsync-locked by DWM composition
+        // even when Present is called with SyncInterval=0: any frame that lands just
+        // past the vblank deadline gets pushed to the NEXT one, which is what was
+        // seen bouncing between the monitor's refresh rate and half of it (144<->72)
+        // instead of scaling smoothly with load. ALLOW_TEARING lets a 0-interval
+        // Present go out immediately instead of waiting for the next vblank.
+        {
+            IDXGIFactory2* f2 = nullptr;
+            if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&f2))) && f2) {
+                IDXGIFactory5* f5 = nullptr;
+                if (SUCCEEDED(f2->QueryInterface(IID_PPV_ARGS(&f5))) && f5) {
+                    BOOL allow = FALSE;
+                    if (SUCCEEDED(f5->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &allow, sizeof(allow))) && allow) {
+                        g.tearingSupported = true;
+                        sd.Flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
+                    }
+                    f5->Release();
+                }
+                f2->Release();
+            }
+            Log("[ne] tearing support: %d\n", (int)g.tearingSupported);
+        }
         D3D_FEATURE_LEVEL fl;
         // The D3D11 debug layer (D3D11_3SDKLayers.dll) validates every call: it costs
         // performance and it also crashed by itself when entering a channel. It is only
@@ -1272,12 +1555,13 @@ struct NDevice : Unk<IDirect3DDevice9> {
         Log("[ne] D3D11 create hr=0x%08X fl=0x%X %ux%u\n", hr, fl, g.bbW, g.bbH);
         if (SUCCEEDED(hr) && g.dev && SUCCEEDED(g.dev->QueryInterface(__uuidof(ID3D11InfoQueue), (void**)&g.iq)) && g.iq) Log("[ne] D3D11 debug layer ON\n");
         if (SUCCEEDED(hr) && g.sc) {
-            ID3D11Texture2D* bb = nullptr;
-            if (SUCCEEDED(g.sc->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&bb)) && bb) { g.dev->CreateRenderTargetView(bb, nullptr, &g.rtv); bb->Release(); }
+            if (SUCCEEDED(g.sc->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&g.bbTex)) && g.bbTex) g.dev->CreateRenderTargetView(g.bbTex, nullptr, &g.rtv);
+            CreateMSAATargets(g.bbW, g.bbH);
             D3D11_TEXTURE2D_DESC dd{}; dd.Width = g.bbW; dd.Height = g.bbH; dd.MipLevels = 1; dd.ArraySize = 1;
-            dd.Format = DXGI_FORMAT_D24_UNORM_S8_UINT; dd.SampleDesc.Count = 1; dd.Usage = D3D11_USAGE_DEFAULT; dd.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+            dd.Format = DXGI_FORMAT_D24_UNORM_S8_UINT; dd.SampleDesc.Count = g.msaaSamples; dd.Usage = D3D11_USAGE_DEFAULT; dd.BindFlags = D3D11_BIND_DEPTH_STENCIL;
             if (SUCCEEDED(g.dev->CreateTexture2D(&dd, nullptr, &g.depthTex)) && g.depthTex) g.dev->CreateDepthStencilView(g.depthTex, nullptr, &g.dsv);
-            g.curRTV = g.rtv; g.curDSV = g.dsv;
+            g.curRTV = g.msaaSamples > 1 ? g.msaaRTV : g.rtv; g.curDSV = g.dsv;
+            CreateOutlineTarget(g.bbW, g.bbH);
             BuildDefaultPipeline();
             // Visible proof that it runs on D3D11: API + feature level + real GPU in
             // the window title (it shows up in any screenshot/video).
@@ -1316,8 +1600,27 @@ struct NDevice : Unk<IDirect3DDevice9> {
 
     void ApplyDefaultState() {
         CtxLock lk;
+        // Reverted: routing this through EffDSV() to fix a cosmetic white edge on
+        // character/UI silhouettes (RTV/DSV sample-count mismatch under MSAA) instead
+        // caused the whole character to render solid white -- EffDSV() nulls the depth
+        // here in a case this fixed-function path actually needs it for correct
+        // multi-pass ordering. Back to raw g.curDSV until a fix is found that does not
+        // regress this; the small edge artifact is far less bad than a fully white model.
         g.ctx->OMSetRenderTargets(1, &g.curRTV, g.curDSV);
-        g.ctx->OMSetDepthStencilState(g.dsOff, 0);
+        // Depth was hardcoded off here for EVERY fixed-function draw since the very
+        // first commit -- fine for RHW quads (pre-transformed screen space, no
+        // meaningful depth), but this path is also how world-space effects draw
+        // (DrawPrimitiveUP/DrawIndexedPrimitiveUP: weapon trails, muzzle flashes,
+        // particles), and disabling their depth test unconditionally means they never
+        // compete with real scene depth -- they draw on top of everything (a weapon
+        // effect appearing pinned to the character instead of at the gun) and are never
+        // occluded by geometry between the camera and where they actually are (visible
+        // through walls). RHW draws still force depth off; real XYZ draws now respect
+        // ZENABLE/ZWRITEENABLE like the programmable path (BeginProgDraw) already does.
+        bool isRHWfvf = (fvf & D3DFVF_POSITION_MASK) == D3DFVF_XYZRHW;
+        ID3D11DepthStencilState* fvfDss = isRHWfvf ? g.dsOff :
+            (!rs[D3DRS_ZENABLE] ? g.dsOff : (rs[D3DRS_ZWRITEENABLE] ? g.dsWrite : g.dsNoWrite));
+        g.ctx->OMSetDepthStencilState(fvfDss, 0);
         ApplyViewport();
         { float bs, sl; memcpy(&bs, &rs[D3DRS_DEPTHBIAS], 4); memcpy(&sl, &rs[D3DRS_SLOPESCALEDEPTHBIAS], 4); g.ctx->RSSetState(GetRasterizer(bs, sl, rs[D3DRS_CULLMODE], rs[D3DRS_FILLMODE])); }
         g.ctx->VSSetShader(g.vsDefault, nullptr, 0);
@@ -1356,8 +1659,13 @@ struct NDevice : Unk<IDirect3DDevice9> {
         DWORD tf = rs[D3DRS_TEXTUREFACTOR];
         cb.tfactor[0] = ((tf >> 16) & 0xFF) / 255.f; cb.tfactor[1] = ((tf >> 8) & 0xFF) / 255.f;
         cb.tfactor[2] = (tf & 0xFF) / 255.f;         cb.tfactor[3] = ((tf >> 24) & 0xFF) / 255.f;
-        D3D11_MAPPED_SUBRESOURCE m{};
-        if (SUCCEEDED(g.ctx->Map(g.cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) { memcpy(m.pData, &cb, sizeof(cb)); g.ctx->Unmap(g.cb, 0); }
+        if (!defaultCBValid || memcmp(&lastDefaultCB, &cb, sizeof(cb)) != 0) {
+            D3D11_MAPPED_SUBRESOURCE m{};
+            if (SUCCEEDED(g.ctx->Map(g.cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+                memcpy(m.pData, &cb, sizeof(cb)); g.ctx->Unmap(g.cb, 0);
+                lastDefaultCB = cb; defaultCBValid = true;
+            }
+        }
         g.ctx->VSSetConstantBuffers(0, 1, &g.cb);
         g.ctx->PSSetConstantBuffers(0, 1, &g.cb);
         // A draw with texcoords and NO texture comes out as flat color (white if the
@@ -1427,7 +1735,7 @@ struct NDevice : Unk<IDirect3DDevice9> {
         // What the GAME actually asks for, per distinct target size. Everything measured so
         // far was read off our own D3D11 call in the capture, which cannot tell an argument
         // we decoded wrong from one the game really passed.
-        if (rt && rt != g.rtv) {
+        if (rt && rt != MainSceneRTV()) {
             static LONG n = 0;
             if (InterlockedIncrement(&n) <= 10)
                 Log("[clr] target OFFSCREEN vp=%ux%u flags=0x%X color=0x%08X (a=%u r=%u g=%u b=%u) rects=%u\n",
@@ -1469,6 +1777,19 @@ struct NDevice : Unk<IDirect3DDevice9> {
     }
     STDMETHOD(Present)(const RECT*, const RECT*, HWND, const RGNDATA*) {
         CtxLock lk;
+        {
+            static bool prevF3 = false;
+            bool nowF3 = (GetAsyncKeyState(VK_F3) & 0x8000) != 0;
+            if (nowF3 && !prevF3) { g_outlineEnabled = !g_outlineEnabled; Log("[outline] %s\n", g_outlineEnabled ? "ON" : "OFF"); }
+            prevF3 = nowF3;
+        }
+        // The game's frame lives in the multisampled target (g.msaaRTV) all through the
+        // frame; resolve it into the real, single-sample backbuffer (g.bbTex, behind
+        // g.rtv) here, once, before anything reads g.rtv as "the finished frame" --
+        // CompositeOutline() does exactly that.
+        if (g.ctx && g.msaaSamples > 1 && g.msaaTex && g.bbTex)
+            g.ctx->ResolveSubresource(g.bbTex, 0, g.msaaTex, 0, DXGI_FORMAT_B8G8R8A8_UNORM);
+        CompositeOutline();
         static LONG f = 0; LONG ff = InterlockedIncrement(&f);
         { LONGLONG now = QPC(); if (t_lastPresent) t_frameTotal += now - t_lastPresent; t_lastPresent = now; }
         if ((ff % 120) == 1) {
@@ -1544,7 +1865,11 @@ struct NDevice : Unk<IDirect3DDevice9> {
         }
         // The client picks the interval in D3DPRESENT_PARAMETERS.PresentationInterval.
         // It was pinned to 1 (hard vsync): with the fps cap unlocked it still stayed at 60.
-        if (g.sc) g.sc->Present(syncInterval, 0); return D3D_OK;
+        if (g.sc) {
+            UINT presentFlags = (syncInterval == 0 && g.tearingSupported) ? DXGI_PRESENT_ALLOW_TEARING : 0;
+            g.sc->Present(syncInterval, presentFlags);
+        }
+        return D3D_OK;
     }
     STDMETHOD(Reset)(D3DPRESENT_PARAMETERS* pp) {
         SetSync(pp);
@@ -1554,16 +1879,20 @@ struct NDevice : Unk<IDirect3DDevice9> {
         if (nw == g.bbW && nh == g.bbH) return D3D_OK;
         g.ctx->OMSetRenderTargets(0, nullptr, nullptr);
         if (g.rtv) { g.rtv->Release(); g.rtv = nullptr; }
+        if (g.bbTex) { g.bbTex->Release(); g.bbTex = nullptr; }
+        if (g.msaaRTV) { g.msaaRTV->Release(); g.msaaRTV = nullptr; }
+        if (g.msaaTex) { g.msaaTex->Release(); g.msaaTex = nullptr; }
         if (g.dsv) { g.dsv->Release(); g.dsv = nullptr; }
         if (g.depthTex) { g.depthTex->Release(); g.depthTex = nullptr; }
         g.sc->ResizeBuffers(1, nw, nh, DXGI_FORMAT_B8G8R8A8_UNORM, 0);
         g.bbW = nw; g.bbH = nh;
-        ID3D11Texture2D* bb = nullptr;
-        if (SUCCEEDED(g.sc->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&bb)) && bb) { g.dev->CreateRenderTargetView(bb, nullptr, &g.rtv); bb->Release(); }
+        if (SUCCEEDED(g.sc->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&g.bbTex)) && g.bbTex) g.dev->CreateRenderTargetView(g.bbTex, nullptr, &g.rtv);
+        CreateMSAATargets(nw, nh);
         D3D11_TEXTURE2D_DESC dd{}; dd.Width = nw; dd.Height = nh; dd.MipLevels = 1; dd.ArraySize = 1;
-        dd.Format = DXGI_FORMAT_D24_UNORM_S8_UINT; dd.SampleDesc.Count = 1; dd.Usage = D3D11_USAGE_DEFAULT; dd.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+        dd.Format = DXGI_FORMAT_D24_UNORM_S8_UINT; dd.SampleDesc.Count = g.msaaSamples; dd.Usage = D3D11_USAGE_DEFAULT; dd.BindFlags = D3D11_BIND_DEPTH_STENCIL;
         if (SUCCEEDED(g.dev->CreateTexture2D(&dd, nullptr, &g.depthTex)) && g.depthTex) g.dev->CreateDepthStencilView(g.depthTex, nullptr, &g.dsv);
-        g.curRTV = g.rtv; g.curDSV = g.dsv;
+        g.curRTV = g.msaaSamples > 1 ? g.msaaRTV : g.rtv; g.curDSV = g.dsv;
+        CreateOutlineTarget(nw, nh);
         curVP.X = 0; curVP.Y = 0; curVP.Width = nw; curVP.Height = nh; curVP.MinZ = 0.f; curVP.MaxZ = 1.f;
         Log("[ne] Reset -> %ux%u\n", nw, nh);
         return D3D_OK;
@@ -1634,7 +1963,7 @@ struct NDevice : Unk<IDirect3DDevice9> {
     }
     STDMETHOD(GetRenderTarget)(DWORD, IDirect3DSurface9** pp) {
         if (curRTSurf) { curRTSurf->AddRef(); *pp = curRTSurf; return D3D_OK; }
-        if (!sRT) { sRT = new NSurface(g.bbW, g.bbH, D3DFMT_A8R8G8B8); ((NSurface*)sRT)->neRT.rtv = g.rtv; } // it is the backbuffer
+        if (!sRT) { sRT = new NSurface(g.bbW, g.bbH, D3DFMT_A8R8G8B8); ((NSurface*)sRT)->neRT.rtv = MainSceneRTV(); } // it is the backbuffer
         sRT->AddRef(); *pp = sRT; return D3D_OK;
     }
 
@@ -1691,6 +2020,14 @@ struct NDevice : Unk<IDirect3DDevice9> {
         if (!d || !d->tex) return D3D_OK;
         // source: the given surface, or the backbuffer if it has no texture of its own
         ID3D11Texture2D* srcTex = (s && s->tex) ? s->tex : nullptr;
+        // The real scene lives in g.msaaTex all frame; g.sc's own buffer (below) only gets
+        // that content at Present()'s resolve. Reading it here mid-frame under MSAA means
+        // "the backbuffer" is really last frame's fully-finished image -- the weapon-trail
+        // and scene-reflection effects that StretchRect this into g_TexSceneMap then show
+        // a one-frame-stale, washed-out/white ghost while the character is moving fast.
+        // Resolving here first keeps it current with this frame's progress instead.
+        if (!srcTex && g.ctx && g.msaaSamples > 1 && g.msaaTex && g.bbTex)
+            g.ctx->ResolveSubresource(g.bbTex, 0, g.msaaTex, 0, DXGI_FORMAT_B8G8R8A8_UNORM);
         ID3D11Texture2D* bb = nullptr;
         if (!srcTex && g.sc && SUCCEEDED(g.sc->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&bb))) srcTex = bb;
         if (srcTex) {
@@ -1739,7 +2076,7 @@ struct NDevice : Unk<IDirect3DDevice9> {
         // (0x01D90450) read garbage from back() and crashed.
         curRTSurf = surf;
         NE_RTView* v = NE_QueryRT(surf);
-        g.curRTV = (v && v->rtv) ? v->rtv : g.rtv; // no rtv of its own (or a cached backbuffer) -> backbuffer
+        g.curRTV = (v && v->rtv) ? v->rtv : MainSceneRTV(); // no rtv of its own (or a cached backbuffer) -> backbuffer
         g.ctx->OMSetRenderTargets(1, &g.curRTV, EffDSV());
         // D3D9 resets the viewport to the target size on every SetRenderTarget.
         curVP.X = 0; curVP.Y = 0; curVP.MinZ = 0.f; curVP.MaxZ = 1.f;
@@ -1816,13 +2153,16 @@ struct NDevice : Unk<IDirect3DDevice9> {
         // (FOG_MINDIST/FOG_MAXDIST through CFogPropertyCommand), so those matter every time
         // they CHANGE: the startup ones are not the in-match ones.
         // Log() uses wvsprintfA and does not support %f, which is why the value goes in thousandths.
-        if (s == D3DRS_FOGCOLOR || s == D3DRS_FOGTABLEMODE || s == D3DRS_FOGVERTEXMODE ||
+        if (s == D3DRS_FOGENABLE || s == D3DRS_FOGCOLOR || s == D3DRS_FOGTABLEMODE || s == D3DRS_FOGVERTEXMODE ||
             s == D3DRS_FOGSTART || s == D3DRS_FOGEND || s == D3DRS_FOGDENSITY) {
             static DWORD last[256] = {}; static bool seen[256] = {};
             if (!seen[(DWORD)s] || last[(DWORD)s] != v) {
                 seen[(DWORD)s] = true; last[(DWORD)s] = v;
                 float f; memcpy(&f, &v, 4);
                 Log("[fog] rs=%d val=0x%08lX milesimos=%d\n", (int)s, v, (int)(f * 1000.0f));
+                void** stack = (void**)_AddressOfReturnAddress();
+                Log("[fog-trace] ret=%p this=%p arg_state=%p arg_value=%p\n",
+                    _ReturnAddress(), stack[1], stack[2], stack[3]);
             }
         }
         return D3D_OK;
@@ -1844,7 +2184,7 @@ struct NDevice : Unk<IDirect3DDevice9> {
         // would be a dangling pointer.
         if (s == 1) {
             NTexture* n = (NTexture*)t;
-            if (n && n->srv && n->w == 256 && n->h <= 2 && n->srv != g_rampSRV) {
+            if (n && n->srv && n->w == 256 && (n->h <= 2 || NE_LooksLikeSquareRamp(n)) && n->srv != g_rampSRV) {
                 if (g_rampSRV) g_rampSRV->Release();
                 g_rampSRV = n->srv; g_rampSRV->AddRef();
             }
@@ -1895,7 +2235,7 @@ struct NDevice : Unk<IDirect3DDevice9> {
     // where the effect sits against the screen edge. Only the backbuffer matches g.dsv;
     // on any other render target, run depthless. This is the draw-time catch-all that
     // covers the cases SetDepthStencilSurface(NULL) alone did not.
-    ID3D11DepthStencilView* EffDSV() { return (g.curDSV == g.dsv && g.curRTV != g.rtv) ? nullptr : g.curDSV; }
+    ID3D11DepthStencilView* EffDSV() { return (g.curDSV == g.dsv && g.curRTV != MainSceneRTV()) ? nullptr : g.curDSV; }
     bool BeginProgDraw() {
         if (!g_prog.active) return false;
         CtxLock lk;
@@ -1915,7 +2255,7 @@ struct NDevice : Unk<IDirect3DDevice9> {
         };
         g.ctx->OMSetRenderTargets(1, &g.curRTV, EffDSV());
         ApplyViewport();
-        if (g_effectTargetNeedsAlphaClear && g.curRTV != g.rtv && curVP.Width == 256 && curVP.Height == 256) {
+        if (g_effectTargetNeedsAlphaClear && g.curRTV != MainSceneRTV() && curVP.Width == 256 && curVP.Height == 256) {
             const float transparent[4] = { 1.f, 1.f, 1.f, 0.f };
             g.ctx->ClearRenderTargetView(g.curRTV, transparent);
             g_effectTargetNeedsAlphaClear = false;
@@ -1933,37 +2273,47 @@ struct NDevice : Unk<IDirect3DDevice9> {
         // wall jump / dagger square: a render state the pass asks for and we ignored.
         else if (RS(D3DRS_ALPHABLENDENABLE)) g.ctx->OMSetBlendState(GetBlend(RS(D3DRS_SRCBLEND), RS(D3DRS_DESTBLEND), RS(D3DRS_BLENDOP)), bf, 0xffffffff);
         else g.ctx->OMSetBlendState(nullptr, bf, 0xffffffff);
-        // Fog goes in its own cbuffer at b1, refilled HERE (per draw) and not in
-        // BeginPass. The game toggles FOGENABLE per object, so this is the only place
-        // where the value is the real one for the geometry about to be drawn. The UI
-        // draws with FOGENABLE off, so the wrapper is a no-op for it.
-        if (g.fogCB) {
-            struct { float fog[4]; float col[4]; } fc{};
-            memcpy(&fc.fog[0], &rs[D3DRS_FOGSTART], 4);
-            memcpy(&fc.fog[1], &rs[D3DRS_FOGEND], 4);
-            fc.fog[2] = RS(D3DRS_FOGENABLE) ? 1.f : 0.f;
-            fc.fog[3] = 0.f;
-            DWORD fcol = rs[D3DRS_FOGCOLOR];
-            fc.col[0] = ((fcol >> 16) & 0xFF) / 255.f; fc.col[1] = ((fcol >> 8) & 0xFF) / 255.f;
-            fc.col[2] = (fcol & 0xFF) / 255.f;         fc.col[3] = 1.f;
-            D3D11_MAPPED_SUBRESOURCE fm{};
-            if (SUCCEEDED(g.ctx->Map(g.fogCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &fm))) {
-                memcpy(fm.pData, &fc, sizeof(fc)); g.ctx->Unmap(g.fogCB, 0);
-            }
-            g.ctx->PSSetConstantBuffers(1, 1, &g.fogCB);
-        }
         g.ctx->IASetInputLayout(il);
         g.ctx->VSSetShader(g_prog.vs, nullptr, 0);
         g.ctx->PSSetShader(g_prog.ps, nullptr, 0);
         UINT stride = stream0Stride, off = stream0Off;
         g.ctx->IASetVertexBuffers(0, 1, &stream0->buf, &stride, &off);
+        // NE_FogCB (b1) has to be refilled HERE, not in BindPass (effects.cpp): BindPass
+        // runs once per BeginPass, but the game can draw several objects under the same
+        // pass while toggling FOGENABLE between them (e.g. the sky dome sharing the
+        // terrain's shader with fog off) -- a cbuffer filled once per pass would carry a
+        // stale enable flag into the wrong draw. BeginProgDraw runs right before every
+        // individual draw, so this always reflects the current object's real state.
+        {
+            static int noFog = -1;
+            if (noFog < 0) { char e[8] = ""; noFog = (GetEnvironmentVariableA("NE_NO_FOG", e, sizeof(e)) && e[0] == '1') ? 1 : 0; }
+            static ID3D11Buffer* fogCB = nullptr;
+            if (!noFog && !fogCB) {
+                D3D11_BUFFER_DESC d{}; d.ByteWidth = 32; d.Usage = D3D11_USAGE_DYNAMIC;
+                d.BindFlags = D3D11_BIND_CONSTANT_BUFFER; d.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+                g.dev->CreateBuffer(&d, nullptr, &fogCB);
+            }
+            if (!noFog && fogCB) {
+                float data[8]; NE_FogState(&data[0], &data[4]);
+                D3D11_MAPPED_SUBRESOURCE m{};
+                if (SUCCEEDED(g.ctx->Map(fogCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+                    memcpy(m.pData, data, sizeof(data)); g.ctx->Unmap(fogCB, 0);
+                }
+                g.ctx->PSSetConstantBuffers(1, 1, &fogCB);
+            }
+        }
         return true;
     }
     STDMETHOD(DrawPrimitive)(D3DPRIMITIVETYPE pt, UINT start, UINT primCount) {
         Stopwatch sw;
         InterlockedIncrement(&dbg_DP);
         if (g_prog.active) {
-            if (BeginProgDraw()) { g.ctx->IASetPrimitiveTopology(Topo(pt)); g.ctx->Draw(PrimCount(pt, primCount), start); }
+            if (BeginProgDraw()) {
+                g.ctx->IASetPrimitiveTopology(Topo(pt));
+                UINT vc = PrimCount(pt, primCount);
+                g.ctx->Draw(vc, start);
+                DrawOutlineMaskCopy(false, vc, start, 0);
+            }
             else InterlockedIncrement(&dbg_skipProg);
             return D3D_OK;
         }
@@ -2001,7 +2351,9 @@ struct NDevice : Unk<IDirect3DDevice9> {
                 DXGI_FORMAT ifmt = indices->fmt == D3DFMT_INDEX16 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT;
                 g.ctx->IASetIndexBuffer(indices->buf, ifmt, 0);
                 g.ctx->IASetPrimitiveTopology(Topo(pt));
-                g.ctx->DrawIndexed(PrimCount(pt, primCount), startIdx, baseV);
+                UINT ic = PrimCount(pt, primCount);
+                g.ctx->DrawIndexed(ic, startIdx, baseV);
+                DrawOutlineMaskCopy(true, ic, startIdx, baseV);
             }
             return D3D_OK;
         }
@@ -2183,6 +2535,26 @@ ID3D11PixelShader* NE_FixedFuncPS() { return g.psFF1; }
 // bind the per-stage textures/samplers, just like on the path without an effect.
 void NE_BindFixedFuncPS() {
     NDevice* d = (NDevice*)g_dev9; if (!d || !g.psFF1) return;
+    d->defaultCBValid = false;
+    // Stage 0 with no texture makes PSCore break the whole cascade and return the
+    // vertex color untouched (see the comment by that break -- it was the fix for the
+    // jump-square/railgun white bug). The projected character shadow uses exactly this
+    // fixed-function path (VS_ProjectiveShadow/VS_ProjectiveShadowCast), so if ITS
+    // stage-0 texture never resolves, the same mechanism paints the vertex color
+    // (commonly white, near-full alpha, for a shadow decal whose shape is meant to come
+    // from the texture) instead of a dark gradient -- a white translucent smudge where
+    // a shadow should be, not a missing shadow and not a black one.
+    {
+        static int logged = 0;
+        if (!d->tex[0] && logged < 30) {
+            ++logged;
+            Log("[shadowdbg] fixed-function draw with NO stage-0 texture (tex[0]=null) -- vertex color will show through as-is\n");
+        } else if (d->tex[0] && !d->tex[0]->srv && logged < 30) {
+            ++logged;
+            Log("[shadowdbg] fixed-function draw: stage-0 texture exists but srv=null (format 0x%08X, %ux%u) -- same white-passthrough result\n",
+                (unsigned)d->tex[0]->fmt, d->tex[0]->w, d->tex[0]->h);
+        }
+    }
     CBData cb{};
     for (int st = 0; st < 4; ++st) {
         cb.stageC[st][0] = (float)d->tss[st][D3DTSS_COLOROP];
@@ -2222,23 +2594,37 @@ void NE_BindFixedFuncPS() {
 void NE_FogState(float* fog4, float* color4) {
     NDevice* d = (NDevice*)g_dev9;
     if (!d) { fog4[0]=0; fog4[1]=1; fog4[2]=0; fog4[3]=0; color4[0]=color4[1]=color4[2]=color4[3]=1; return; }
-    memcpy(&fog4[0], &d->rs[D3DRS_FOGSTART], 4);
-    memcpy(&fog4[1], &d->rs[D3DRS_FOGEND], 4);
+    if (g_fogMapValid) {
+        fog4[0] = g_fogMap[0]; fog4[1] = g_fogMap[1];
+    } else {
+        memcpy(&fog4[0], &d->rs[D3DRS_FOGSTART], 4);
+        memcpy(&fog4[1], &d->rs[D3DRS_FOGEND], 4);
+    }
     // TEST (NE_FOG_FORCE=1): ignores FOGENABLE and turns on the shader's fixed blend.
     static int force = -1;
     if (force < 0) { char b[8] = ""; force = (GetEnvironmentVariableA("NE_FOG_FORCE", b, sizeof(b)) && b[0] == '1') ? 1 : 0; }
-    // The effect's cbuffer is uploaded once per BeginPass, and the game toggles
-    // FOGENABLE per object: reading it at that instant gave 0 almost always and the
-    // whole pass came out without fog. As an approximation we use "the map HAS fog
-    // configured" (a valid range), which holds for the world geometry; the UI and the
-    // effects do not go through this shader.
-    float fs = fog4[0], fe = fog4[1];
-    bool configured = (fe > fs) && (fe > 1.f);
-    fog4[2] = (force || configured || d->rs[D3DRS_FOGENABLE]) ? 1.f : 0.f;
+    // Used to be read once per BeginPass, when the game can draw several objects
+    // (e.g. the sky dome sharing a shader with fogged terrain) under one pass while
+    // toggling FOGENABLE between them -- that stale read is why this used to fall
+    // back to "the map HAS fog configured" instead of trusting it. Now that this is
+    // called from BeginProgDraw, right before each individual draw, FOGENABLE is
+    // accurate for THIS object, so it is authoritative again: trusting the map-wide
+    // fallback over it was exactly what fogged the sky, which the game deliberately
+    // draws with fog off.
+    fog4[2] = (force || d->rs[D3DRS_FOGENABLE]) ? 1.f : 0.f;
     fog4[3] = force ? 1.f : 0.f;   // NE_FOG_FORCE also turns on the fixed test blend
-    DWORD c = d->rs[D3DRS_FOGCOLOR];
-    color4[0] = ((c >> 16) & 0xFF) / 255.f; color4[1] = ((c >> 8) & 0xFF) / 255.f;
-    color4[2] = (c & 0xFF) / 255.f;         color4[3] = 1.f;
+    if (g_fogMapValid) {
+        color4[0] = g_fogMap[2]; color4[1] = g_fogMap[3]; color4[2] = g_fogMap[4]; color4[3] = 1.f;
+    } else {
+        DWORD c = d->rs[D3DRS_FOGCOLOR];
+        color4[0] = ((c >> 16) & 0xFF) / 255.f; color4[1] = ((c >> 8) & 0xFF) / 255.f;
+        color4[2] = (c & 0xFF) / 255.f;         color4[3] = 1.f;
+    }
+}
+void NE_SetFogValues(float minDist, float maxDist, float r, float g, float b) {
+    g_fogMap[0] = minDist; g_fogMap[1] = maxDist;
+    g_fogMap[2] = r; g_fogMap[3] = g; g_fogMap[4] = b;
+    InterlockedExchange(&g_fogMapValid, 1);
 }
 ID3D11ShaderResourceView* NE_SceneSRV() { return g_sceneSRV; }
 void NE_SetPassStates(const DWORD* states, const DWORD* values, int count) {
@@ -2265,7 +2651,8 @@ float NE_AlphaRef() {
     // transparent parts you get opaque blotches (the web engine uses alphaTest 0.1)
     return 0.02f;
 }
-void NE_SetProgram(ID3D11VertexShader* vs, ID3D11PixelShader* ps, const void* vsbc, SIZE_T vslen) {
+void NE_SetProgram(ID3D11VertexShader* vs, ID3D11PixelShader* ps, const void* vsbc, SIZE_T vslen, bool isSkinned) {
+    g_prog.isSkinned = isSkinned;
     g_prog.vs = vs; g_prog.ps = ps; g_prog.vsbc = vsbc; g_prog.vslen = vslen; g_prog.active = true;
 }
 void NE_ClearProgram() { g_prog.active = false; g_passStateCount = 0; }

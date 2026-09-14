@@ -24,7 +24,7 @@ bool NE_IsAdditive();
 float NE_AlphaRef();
 // the effect sets the active "program" (D3D11 VS/PS + the VS bytecode for the
 // input layout) before the game calls DrawPrimitive/DrawIndexedPrimitive.
-void NE_SetProgram(ID3D11VertexShader* vs, ID3D11PixelShader* ps, const void* vsBytecode, SIZE_T vsLen);
+void NE_SetProgram(ID3D11VertexShader* vs, ID3D11PixelShader* ps, const void* vsBytecode, SIZE_T vsLen, bool isSkinned = false);
 void NE_ClearProgram();
 // fixed-function pixel shader for the .fx passes with PixelShader = null
 // (projected shadows, TextureNoise); NE_BindFixedFuncPS uploads its state.
@@ -32,6 +32,7 @@ ID3D11PixelShader* NE_FixedFuncPS();
 void NE_BindFixedFuncPS();
 // D3D9 fixed-function fog: fog = (start, end, enable, 0), color = rgba
 void NE_FogState(float* fog4, float* color4);
+void NE_SetFogValues(float minDist, float maxDist, float r, float g, float b);
 // SCENE texture (512x512) filled by UpdateScreenTexture; the .fx files sample it
 // as g_TexSceneMap. Without it the white fallback paints the whole quad.
 ID3D11ShaderResourceView* NE_SceneSRV();

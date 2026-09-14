@@ -180,6 +180,7 @@ static bool JmpPatch(void* site, void* fn, const char* name, const char* expect)
     Log("[ne] %s patched at %p\n", name, p);
     return true;
 }
+
 void InstallHashIndexGuards() {
     JmpPatch((void*)S4(0x01CAE4F0), (void*)&Safe_HashIndexShift, "HashIndexShift", "\x55\x8B\xEC");
     JmpPatch((void*)S4(0x01C80BA0), (void*)&Safe_HashIndexPlain, "HashIndexPlain", "\x55\x8B\xEC");

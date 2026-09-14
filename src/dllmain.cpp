@@ -8,7 +8,7 @@
 #include "log.h"
 #include "s4_base.h"
 
-namespace ne { void ApplyImportTable(bool noLoadLibrary); void HarvestImports(); void InstallStringIterGuard(); void InstallBackHook(); void InstallFontLockCrashFix(); void InstallHashIndexGuards(); void InstallFontMemsetGuard(); void InstallContainerGuard(); void InstallMatrixCopyGuard(); void InstallSafeMemcpyS(); void InstallComAssignGuard(); void InstallRenderTargetStackGuard(); void InstallPoolDestroyGuard(); void InstallCriticalSectionGuard(); }
+namespace ne { void ApplyImportTable(bool noLoadLibrary); void HarvestImports(); void InstallStringIterGuard(); void InstallBackHook(); void InstallFontLockCrashFix(); void InstallHashIndexGuards(); void InstallFontMemsetGuard(); void InstallContainerGuard(); void InstallMatrixCopyGuard(); void InstallSafeMemcpyS(); void InstallComAssignGuard(); void InstallRenderTargetStackGuard(); void InstallPoolDestroyGuard(); void InstallCriticalSectionGuard(); void InstallFogApplyTrace(); }
 
 // diagnostics: log where it crashes (module + offset + backtrace)
 static void ModOf(void* addr, char* out, void** base) {
@@ -105,6 +105,7 @@ static DWORD WINAPI InitThread(LPVOID) {
     // faulting address lands inside ntdll; it is heap-luck dependent, so it comes and
     // goes between runs and machines.
     ne::InstallCriticalSectionGuard();
+    ne::InstallFogApplyTrace();
     // ne::InstallBackHook();  // the 5-byte trampoline split an instruction -> crash on startup
     AddVectoredExceptionHandler(1, Veh);
     AddVectoredContinueHandler(1, Veh);   // a 0xC0000409 fastfail does not always go through the normal VEH

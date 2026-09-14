@@ -40,6 +40,12 @@ struct ShaderProg {
     ID3D11Buffer* psCB = nullptr; UINT psCBsize = 0; std::vector<VarSlot> psVars; std::vector<BYTE> psShadow;
     std::vector<TexBind> psTex;
     std::string vsEntry, psEntry;
+    // This PASS's own VS references g_matBone directly (computed from its isolated
+    // function body via FuncBody(), not the whole .fx file -- a multi-technique file
+    // can hold both a skinned character pass and an unrelated static one, and the
+    // file-wide version of this check outlined a lobby wall panel that happened to
+    // share a file with an actual character shader).
+    bool isSkinned = false;
 };
 // A pass in a .fx also carries RENDER STATES, and D3DX applies them to the device
 // when the pass begins. We were ignoring them entirely, so every pass inherited
@@ -240,7 +246,15 @@ struct MyEffect : public ID3DXEffect {
         ParseDefaults(full);
         if (ID3D11Device* dev = NE_Dev()) {
             D3D11_SAMPLER_DESC sd{}; sd.Filter = D3D11_FILTER_ANISOTROPIC; sd.MaxAnisotropy = 16;
-            sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_WRAP; sd.MaxLOD = 0.0f; // mip 0 only (D3DX does not fill the higher levels)
+            // MaxLOD used to be pinned to 0 here (mip 0 only) because D3DX did not fill the
+            // higher levels and they came out white/noisy. That was fixed later by
+            // implementing real render targets + StretchRect (see backend_d3d11.cpp's OWN
+            // effect sampler at ~line 761, already raised to FLOAT32_MAX with the note "without
+            // this we lose mipmapping and aliasing/shimmering appears"). This sampler -- the one
+            // actually used by D3DXCreateEffect materials: world/character/weapon shaders, the
+            // most visible draws in the game -- was never updated to match. If the white bug
+            // resurfaces, this line is the one to revert.
+            sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_WRAP; sd.MaxLOD = D3D11_FLOAT32_MAX;
             dev->CreateSamplerState(&sd, &samp);
             { D3D11_SAMPLER_DESC cd = sd; cd.AddressU = cd.AddressV = cd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
               dev->CreateSamplerState(&cd, &sampClamp); }
@@ -539,20 +553,50 @@ struct MyEffect : public ID3DXEffect {
     // to guess with "the map has fog configured" -- which also fogged the UI, which is
     // why the whole wrapper ended up disabled. b1 is refilled on every draw by the
     // backend, so each object gets its own real enable.
-    std::string FogWrapper(const std::string& entry, const std::string& sname) {
-        // Depth comes from the struct member that already carries POSITION, whatever
-        // it is called. Under backwards compatibility that semantic maps to
-        // SV_Position, whose .w holds 1/w, so the view depth is its reciprocal.
+    std::string FogWrapper(const std::string& entry, const std::string& sname, const std::string& base) {
         std::string pos = PositionMember(sname);
-        if (pos.empty()) return "";   // no depth to read: no fog wrapper, alpha test still applies
+        if (pos.empty()) return "";
         return "\ncbuffer NE_FogCB : register(b1) { float4 g_NE_Fog; float4 g_NE_FogColor; };\n"
                "float4 " + entry + "_NEFOG(" + sname + " In) : COLOR {\n"
-               "  float4 c = " + entry + "_NEAT(In);\n"
+               "  float4 c = " + base + "(In);\n"
                "  if (g_NE_Fog.z > 0.5) {\n"
-               "    float d = 1.0 / max(In." + pos + ".w, 1e-8);   // POSITION maps to SV_Position, .w is 1/w\n"
+               // This struct's member is tagged the plain D3D9 semantic "POSITION", not
+               // SV_Position -- it is whatever the vertex shader wrote to its own POSITION
+               // output (the raw post-WVP clip position), not the rasterizer's screen-space
+               // value. For a standard perspective projection matrix .w after that multiply
+               // equals the view-space Z already (the classic D3D9 "w-friendly" trick used
+               // for cheap linear fog), so it IS the depth directly -- no reciprocal.
+               // Inverting it (as SV_Position's real 1/w would require) made d a tiny
+               // fraction for any real-world depth, which saturated the fog blend to "no
+               // fog" at every distance: that was the whole bug, not just an approximation.
+               "    float d = In." + pos + ".w;\n"
                "    float f = saturate((g_NE_Fog.y - d) / max(g_NE_Fog.y - g_NE_Fog.x, 0.001));\n"
                "    c.rgb = lerp(g_NE_FogColor.rgb, c.rgb, f);\n  }\n"
                "  return c;\n}\n";
+    }
+    // AlphaTestWrapper only sets atStruct for entries that need alpha test -- most
+    // opaque world materials don't, so they never got this far and fog was silently
+    // skipped for them. Same struct-name lookup, without the alpha-test side effects.
+    std::string EntryStructName(const std::string& entry) {
+        size_t p = FindWord(hlsl, entry, 0);
+        while (p != std::string::npos) {
+            size_t op = hlsl.find('(', p);
+            if (op == std::string::npos) break;
+            size_t cp = hlsl.find(')', op);
+            if (cp == std::string::npos) break;
+            std::string args = hlsl.substr(op + 1, cp - op - 1);
+            size_t a = args.find_first_not_of(" \t\r\n");
+            if (a != std::string::npos) {
+                size_t b = args.find_first_of(" \t\r\n", a);
+                if (b != std::string::npos) {
+                    std::string sname = args.substr(a, b - a);
+                    if (!sname.empty() && sname != "float4" && sname != "float3" && sname != "float2" && sname != "float")
+                        return sname;
+                }
+            }
+            p = FindWord(hlsl, entry, p + 1);
+        }
+        return "";
     }
     bool CompileOne(const std::string& entry, const char* target, ShaderProg& sp, bool isVS, const std::string& vsEntry = std::string()) {
         if (entry.empty()) {
@@ -578,8 +622,16 @@ struct MyEffect : public ID3DXEffect {
             if (!w.empty()) {
                 atOnly = hlsl + w; use = atOnly; ent = entry + "_NEAT";
                 if (!atStruct.empty()) {
-                    std::string fw = FogWrapper(entry, atStruct);
+                    std::string fw = FogWrapper(entry, atStruct, entry + "_NEAT");
                     if (!fw.empty()) { use = atOnly + fw; ent = entry + "_NEFOG"; }
+                }
+            } else {
+                // No alpha test needed for this entry: still try fog directly on top
+                // of the plain entry point, same fallback-to-original-entry on failure.
+                std::string sname = EntryStructName(entry);
+                if (!sname.empty()) {
+                    std::string fw = FogWrapper(entry, sname, entry);
+                    if (!fw.empty()) { use = hlsl + fw; ent = entry + "_NEFOG"; }
                 }
             }
         }
@@ -650,6 +702,7 @@ struct MyEffect : public ID3DXEffect {
     ShaderProg* GetProg(Pass& p) {
         if (p.prog) return p.prog;
         ShaderProg* sp = new ShaderProg(); sp->built = true; sp->vsName = p.vsEntry;
+        sp->isSkinned = FuncBody(p.vsEntry).find("g_matBone") != std::string::npos;
         bool a = CompileOne(p.vsEntry, "vs_4_0", *sp, true);
         // PixelShader = null in the .fx: in D3D9 that leaves the pixel to the
         // fixed-function pipeline (texture stages), it does not mean "do not draw".
@@ -687,13 +740,17 @@ struct MyEffect : public ID3DXEffect {
             if (sp->vsCB) ctx->VSSetConstantBuffers(0, 1, &sp->vsCB);
             NE_BindFixedFuncPS();
             NE_SetProgram(sp->vs, sp->ps, sp->vsBlob ? sp->vsBlob->GetBufferPointer() : nullptr,
-                          sp->vsBlob ? sp->vsBlob->GetBufferSize() : 0);
+                          sp->vsBlob ? sp->vsBlob->GetBufferSize() : 0, sp->isSkinned);
             return;
         }
         UploadCB(sp->vsCB, sp->vsShadow, sp->vsVars);
         UploadCB(sp->psCB, sp->psShadow, sp->psVars);
         if (sp->vsCB) ctx->VSSetConstantBuffers(0, 1, &sp->vsCB);
         if (sp->psCB) ctx->PSSetConstantBuffers(0, 1, &sp->psCB);
+        // NE_FogCB (b1) is filled in BeginProgDraw (backend_d3d11.cpp), not here: this
+        // function runs once per BeginPass, but the game draws multiple objects under one
+        // pass while toggling FOGENABLE between them (e.g. sky vs terrain sharing a
+        // shader) -- filling it here would carry a stale enable flag across objects.
         // The effect materials in the .scn are "alphablend2" = additive, so filtering
         // by additive isolates exactly the effect draws (weapon trails, the wall jump
         // wave) from the world geometry. Keyed by shader, not by a call counter, so it
@@ -791,14 +848,29 @@ struct MyEffect : public ID3DXEffect {
         if (samp) {
             for (auto& tb : sp->psTex) {
                 auto cit = samplerClamp.find(tb.name);
-                ID3D11SamplerState* s = (cit != samplerClamp.end() && cit->second && sampClamp) ? sampClamp : samp;
+                bool wantsClamp = cit != samplerClamp.end() && cit->second;
+                // The .fx source for the world shader's ShadeMapSampler does not itself
+                // declare AddressU=CLAMP, so the check above misses it and it falls back
+                // to WRAP. A light ramp lookup (DifPow, a dot-product term) is meant to
+                // saturate at 0/1, not repeat; with WRAP, floating-point drift pushing it
+                // fractionally past 1.0 at grazing view angles wraps around to the DARK
+                // end of the ramp instead of clamping to the bright one -- a sudden flip
+                // that reads as flicker tied to which direction the camera is facing.
+                if (!wantsClamp) {
+                    auto sit = samplerToTex.find(tb.name);
+                    const std::string& texName = sit != samplerToTex.end() ? sit->second : tb.name;
+                    const std::string n2 = tb.name + texName;
+                    if (n2.find("Shade") != std::string::npos || n2.find("Light") != std::string::npos)
+                        wantsClamp = true;
+                }
+                ID3D11SamplerState* s = (wantsClamp && sampClamp) ? sampClamp : samp;
                 ctx->PSSetSamplers(tb.slot, 1, &s);
             }
             if (sp->psTex.empty()) { ID3D11SamplerState* s = samp; ctx->PSSetSamplers(0, 1, &s); }
         }
         const void* bc = sp->vsBlob ? sp->vsBlob->GetBufferPointer() : nullptr;
         SIZE_T bl = sp->vsBlob ? sp->vsBlob->GetBufferSize() : 0;
-        NE_SetProgram(sp->vs, sp->ps, bc, bl);
+        NE_SetProgram(sp->vs, sp->ps, bc, bl, sp->isSkinned);
     }
 
     // stores a value by name
