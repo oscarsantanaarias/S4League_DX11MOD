@@ -393,7 +393,7 @@ static void DrawSSAO() {
     if (!g_cfg.ao || !g.ctx || !g.dev || !g.depthSRV || !g.rtv) return;
     if (!BuildBlit(g.dev) || !BuildAO(g.dev)) return;
     ID3D11PixelShader* ps = g.msaaSamples > 1 ? g_aoPS_MS : g_aoPS_1x;
-    if (!ps) return;
+    if (!ps || !g_aoCB || !g_aoBlend) return;
     D3D11_MAPPED_SUBRESOURCE m{};
     if (SUCCEEDED(g.ctx->Map(g_aoCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
         float data[8] = { 1.0f / g.bbW, 1.0f / g.bbH, g_aoProj33, g_aoProj43, g_cfg.aoRadius, g_cfg.aoStrength, 0, 0 };
@@ -596,15 +596,37 @@ static void CreateMSAATargets(UINT w, UINT h) {
 // TYPELESS resource with two views: a DSV interpreting it as a real depth format for
 // the normal draw path, and an SRV interpreting the same bits as a plain color format
 // for reading. Depends on g.msaaSamples, so call this AFTER CreateMSAATargets().
+// Falls back to a depth-only buffer (no SRV, the format this always used before SSAO)
+// whenever the combined DEPTH_STENCIL|SHADER_RESOURCE typeless format the SSAO path
+// needs doesn't create cleanly. That combination failing to create at all -- not just
+// the view, the TEXTURE ITSELF -- on some GPU/driver left the whole scene with zero
+// depth buffer, not just AO disabled: every draw assuming g.dsv exists broke at once,
+// which is what actually crashed and corrupted UI layout on a machine this wasn't
+// tested on, nothing about AO specifically. AO simply won't run without a depthSRV
+// (DrawSSAO already checks for that), so falling back here is a silent, safe downgrade.
 static void CreateSceneDepth(UINT w, UINT h) {
     if (g.dsv) { g.dsv->Release(); g.dsv = nullptr; }
     if (g.depthSRV) { g.depthSRV->Release(); g.depthSRV = nullptr; }
     if (g.depthTex) { g.depthTex->Release(); g.depthTex = nullptr; }
+
     D3D11_TEXTURE2D_DESC dd{}; dd.Width = w; dd.Height = h; dd.MipLevels = 1; dd.ArraySize = 1;
     dd.Format = DXGI_FORMAT_R24G8_TYPELESS; dd.SampleDesc.Count = g.msaaSamples; dd.Usage = D3D11_USAGE_DEFAULT;
     dd.BindFlags = D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE;
-    HRESULT hrTex = FAILED(g.dev->CreateTexture2D(&dd, nullptr, &g.depthTex)) ? E_FAIL : S_OK;
-    if (FAILED(hrTex) || !g.depthTex) { Log("[ne] scene depth tex FAILED\n"); return; }
+    bool withSRV = SUCCEEDED(g.dev->CreateTexture2D(&dd, nullptr, &g.depthTex)) && g.depthTex;
+
+    if (!withSRV) {
+        Log("[ne] scene depth: combined depth+SRV format failed, falling back to depth-only (no AO)\n");
+        D3D11_TEXTURE2D_DESC dd2{}; dd2.Width = w; dd2.Height = h; dd2.MipLevels = 1; dd2.ArraySize = 1;
+        dd2.Format = DXGI_FORMAT_D24_UNORM_S8_UINT; dd2.SampleDesc.Count = g.msaaSamples; dd2.Usage = D3D11_USAGE_DEFAULT;
+        dd2.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+        if (FAILED(g.dev->CreateTexture2D(&dd2, nullptr, &g.depthTex)) || !g.depthTex) {
+            Log("[ne] scene depth tex FAILED entirely\n"); return;
+        }
+        g.dev->CreateDepthStencilView(g.depthTex, nullptr, &g.dsv);
+        Log("[ne] scene depth: depth-only fallback ok, samples=%u\n", g.msaaSamples);
+        return;
+    }
+
     D3D11_DEPTH_STENCIL_VIEW_DESC dvd{}; dvd.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
     dvd.ViewDimension = g.msaaSamples > 1 ? D3D11_DSV_DIMENSION_TEXTURE2DMS : D3D11_DSV_DIMENSION_TEXTURE2D;
     HRESULT hrDsv = g.dev->CreateDepthStencilView(g.depthTex, &dvd, &g.dsv);
@@ -612,6 +634,19 @@ static void CreateSceneDepth(UINT w, UINT h) {
     if (g.msaaSamples > 1) { svd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DMS; }
     else { svd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D; svd.Texture2D.MipLevels = 1; }
     HRESULT hrSrv = g.dev->CreateShaderResourceView(g.depthTex, &svd, &g.depthSRV);
+    if (FAILED(hrDsv) || !g.dsv) {
+        // The texture itself is fine but the DSV specifically isn't -- same safety net,
+        // rebuild depth-only from scratch rather than leave a half-working state.
+        Log("[ne] scene depth: DSV creation failed (0x%08X), falling back to depth-only\n", hrDsv);
+        if (g.depthSRV) { g.depthSRV->Release(); g.depthSRV = nullptr; }
+        if (g.depthTex) { g.depthTex->Release(); g.depthTex = nullptr; }
+        D3D11_TEXTURE2D_DESC dd2{}; dd2.Width = w; dd2.Height = h; dd2.MipLevels = 1; dd2.ArraySize = 1;
+        dd2.Format = DXGI_FORMAT_D24_UNORM_S8_UINT; dd2.SampleDesc.Count = g.msaaSamples; dd2.Usage = D3D11_USAGE_DEFAULT;
+        dd2.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+        if (SUCCEEDED(g.dev->CreateTexture2D(&dd2, nullptr, &g.depthTex)) && g.depthTex)
+            g.dev->CreateDepthStencilView(g.depthTex, nullptr, &g.dsv);
+        return;
+    }
     Log("[ne] scene depth: dsv=0x%08X srv=0x%08X samples=%u\n", hrDsv, hrSrv, g.msaaSamples);
 }
 
