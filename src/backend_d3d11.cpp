@@ -23,6 +23,9 @@
 #include <cstdint>
 #include <cstring>
 #include <vector>
+#include <string>
+#include <fstream>
+#include <sstream>
 #include "iat.h"
 #include "log.h"
 #include "s4_base.h"
@@ -33,6 +36,58 @@
 #pragma comment(lib, "d3dcompiler.lib")
 
 namespace ne {
+
+// ---- nativeengine_config.json ----
+// A flat, hand-rolled reader instead of pulling in a JSON library for six numbers:
+// the file only ever holds top-level "key": value pairs (numbers/true/false), so a
+// substring search per key is all this needs. Lets these be toggled by editing a
+// text file next to the game instead of setting environment variables and
+// relaunching from a shell every time.
+struct NEConfig {
+    int msaa = -1;          // -1 = auto (highest the GPU supports), 0/1 = off, else forced count
+    bool fog = true;
+    bool ao = true;
+    float aoRadius = 3.0f;
+    float aoStrength = 1.0f;
+    bool vsync = true;      // true = respect what the game asked for; false = force uncapped
+    bool outlineDefault = false; // F3 starts on/off
+};
+static NEConfig g_cfg;
+static bool JFindNumber(const std::string& text, const char* key, double& out) {
+    std::string k = std::string("\"") + key + "\"";
+    size_t p = text.find(k);
+    if (p == std::string::npos) return false;
+    p = text.find(':', p + k.size());
+    if (p == std::string::npos) return false;
+    p++;
+    while (p < text.size() && isspace((unsigned char)text[p])) p++;
+    if (text.compare(p, 4, "true") == 0) { out = 1.0; return true; }
+    if (text.compare(p, 5, "false") == 0) { out = 0.0; return true; }
+    char* end = nullptr;
+    double v = strtod(text.c_str() + p, &end);
+    if (end == text.c_str() + p) return false;
+    out = v; return true;
+}
+static void LoadConfig() {
+    static bool loaded = false;
+    if (loaded) return;
+    loaded = true;
+    std::ifstream f("nativeengine_config.json");
+    if (!f) { Log("[ne] no nativeengine_config.json, using defaults\n"); return; }
+    std::stringstream ss; ss << f.rdbuf();
+    std::string text = ss.str();
+    double v;
+    if (JFindNumber(text, "msaa", v)) g_cfg.msaa = (int)v;
+    if (JFindNumber(text, "fog", v)) g_cfg.fog = v != 0;
+    if (JFindNumber(text, "ao", v)) g_cfg.ao = v != 0;
+    if (JFindNumber(text, "ao_radius", v)) g_cfg.aoRadius = (float)v;
+    if (JFindNumber(text, "ao_strength", v)) g_cfg.aoStrength = (float)v;
+    if (JFindNumber(text, "vsync", v)) g_cfg.vsync = v != 0;
+    if (JFindNumber(text, "outline_default", v)) g_cfg.outlineDefault = v != 0;
+    Log("[ne] config loaded: msaa=%d fog=%d ao=%d ao_radius=%d/1000 ao_strength=%d/1000 vsync=%d outline=%d\n",
+        g_cfg.msaa, (int)g_cfg.fog, (int)g_cfg.ao, (int)(g_cfg.aoRadius*1000), (int)(g_cfg.aoStrength*1000),
+        (int)g_cfg.vsync, (int)g_cfg.outlineDefault);
+}
 
 void NE_FogState(float* fog4, float* color4);
 
@@ -101,6 +156,16 @@ static bool BuildBlit(ID3D11Device* dev) {
     dev->CreateSamplerState(&sd, &g_blitSamp);
     return g_blitVS && g_blitPS;
 }
+
+// ---- SSAO ----
+// Cheap screen-space AO with no normal buffer: sample a small ring of neighbours
+// around each pixel, linearize their depth the same way, and darken the centre when a
+// neighbour is meaningfully closer to the camera (a corner/crease). Not physically
+// accurate (no normal-oriented hemisphere), but a corner or contact point reads the
+// same either way, and it costs one depth-only pass with no G-buffer to build.
+// Two pixel shader variants because a non-multisampled depth texture cannot be bound
+// as Texture2DMS (and vice versa): which one runs is picked at draw time from
+// g.msaaSamples, not baked into one shader.
 
 
 // ---- Mip generation for COMPRESSED textures (BC1/BC3) ----
@@ -220,6 +285,7 @@ struct Gpu {
     ID3D11BlendState* blend = nullptr;
     ID3D11RasterizerState* rsNoCull = nullptr;
     ID3D11Texture2D* depthTex = nullptr; ID3D11DepthStencilView* dsv = nullptr;
+    ID3D11ShaderResourceView* depthSRV = nullptr; // same texture, read by the SSAO pass
     ID3D11DepthStencilState* dsWrite = nullptr, * dsNoWrite = nullptr, * dsOff = nullptr;
     ID3D11Buffer* fogCB = nullptr;   // PER-DRAW fog (b1), not per BeginPass
     ID3D11InfoQueue* iq = nullptr;
@@ -245,6 +311,122 @@ struct Gpu {
     ID3D11RenderTargetView* msaaRTV = nullptr;
     UINT msaaSamples = 1;
 } g;
+
+static float g_aoProj33 = 1.f, g_aoProj43 = 1.f; // set from the game's real projection matrix each frame
+static ID3D11PixelShader* g_aoPS_MS = nullptr;   // depth texture is multisampled
+static ID3D11PixelShader* g_aoPS_1x = nullptr;   // depth texture is single-sample
+static ID3D11Buffer* g_aoCB = nullptr;
+static ID3D11BlendState* g_aoBlend = nullptr;    // dest *= src.rgb (AO factor)
+static const char* kAOCommonHLSL = R"(
+cbuffer AOCB : register(b0) { float2 texel; float proj33; float proj43; float radius; float strength; float3 pad0; };
+struct V { float4 p : SV_Position; float2 uv : TEXCOORD0; };
+static const float2 kTaps[8] = {
+    float2( 1, 0), float2(-1, 0), float2( 0, 1), float2( 0,-1),
+    float2( 0.707, 0.707), float2(-0.707, 0.707), float2( 0.707,-0.707), float2(-0.707,-0.707)
+};
+float LinDepth(float z) { return proj43 / max(z - proj33, 1e-5); }
+float AOFromCenter(float centerLin, float2 uv0) {
+    float occ = 0;
+    [unroll] for (int i = 0; i < 8; ++i) {
+        float2 uv = uv0 + kTaps[i] * texel * radius;
+)";
+static const char* kAOSampleMS = "        float z = DEPTHTEX.Load(int2(uv * SCREENSIZE), 0).r;\n";
+static const char* kAOSample1x = "        float z = DEPTHTEX.Load(int3(uv * SCREENSIZE, 0)).r;\n";
+static const char* kAOTailHLSL = R"(
+        float d = LinDepth(z);
+        float diff = centerLin - d; // positive: neighbour is closer to camera
+        occ += saturate(diff / max(centerLin * 0.05, 1.0)) * saturate(1.0 - abs(diff) / (centerLin * 0.3 + 1.0));
+    }
+    return saturate(1.0 - (occ / 8.0) * strength);
+}
+float4 PSao(V i) : SV_Target {
+    float cz = CENTERLOAD;
+    float centerLin = LinDepth(cz);
+    float ao = AOFromCenter(centerLin, i.uv);
+    return float4(ao, ao, ao, 1);
+}
+)";
+static bool BuildAO(ID3D11Device* dev) {
+    if (g_aoPS_MS || g_aoPS_1x) return true;
+    auto compile = [&](bool ms) -> ID3D11PixelShader* {
+        std::string src = std::string(kAOCommonHLSL) + (ms ? kAOSampleMS : kAOSample1x) + kAOTailHLSL;
+        // ps_4_0 requires the sample count baked into the type (Texture2DMS<float,N>);
+        // it can't be generic. g.msaaSamples is fixed for the process's lifetime, so
+        // this only ever compiles the one variant that actually matches the real
+        // depth texture.
+        char msDecl[64]; wsprintfA(msDecl, "Texture2DMS<float,%u> DEPTHTEX : register(t0);\n", g.msaaSamples);
+        std::string decl = ms ? std::string(msDecl) : "Texture2D<float> DEPTHTEX : register(t0);\n";
+        // SCREENSIZE has to be real pixel dimensions for Load's integer coords, not the
+        // 0..1 uv this shader otherwise works in -- passed as part of the cbuffer instead
+        // of a macro so both variants share the exact same source apart from the Load line.
+        std::string full = "cbuffer AOSize : register(b1) { float2 SCREENSIZE; float2 pad1; };\n" + decl + src;
+        size_t p = full.find("CENTERLOAD");
+        std::string centerLoad = ms ? "DEPTHTEX.Load(int2(i.uv * SCREENSIZE), 0).r" : "DEPTHTEX.Load(int3(i.uv * SCREENSIZE, 0)).r";
+        full.replace(p, strlen("CENTERLOAD"), centerLoad);
+        ID3DBlob* pb = nullptr; ID3DBlob* er = nullptr;
+        // Texture2DMS access from a pixel shader needs SM4.1+; ps_4_0 (used everywhere
+        // else in this file) rejects it outright. ps_5_0 is supported on any real D3D11
+        // device, so just use it for both AO variants rather than juggling two profiles.
+        HRESULT hr = D3DCompile(full.c_str(), full.size(), "ao", nullptr, nullptr, "PSao", "ps_5_0", 0, 0, &pb, &er);
+        if (FAILED(hr)) { if (er) { Log("[ao] compile fail: %.400s\n", (char*)er->GetBufferPointer()); er->Release(); } return nullptr; }
+        ID3D11PixelShader* ps = nullptr;
+        dev->CreatePixelShader(pb->GetBufferPointer(), pb->GetBufferSize(), nullptr, &ps);
+        pb->Release(); if (er) er->Release();
+        return ps;
+    };
+    g_aoPS_MS = compile(true);
+    g_aoPS_1x = compile(false);
+    D3D11_BUFFER_DESC cbd{}; cbd.ByteWidth = 32; cbd.Usage = D3D11_USAGE_DYNAMIC;
+    cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER; cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    dev->CreateBuffer(&cbd, nullptr, &g_aoCB);
+    D3D11_BLEND_DESC bd{}; bd.RenderTarget[0].BlendEnable = TRUE;
+    bd.RenderTarget[0].SrcBlend = D3D11_BLEND_ZERO; bd.RenderTarget[0].DestBlend = D3D11_BLEND_SRC_COLOR;
+    bd.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+    bd.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ZERO; bd.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ONE;
+    bd.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+    bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+    dev->CreateBlendState(&bd, &g_aoBlend);
+    return (g_aoPS_MS || g_aoPS_1x) && g_aoCB && g_aoBlend;
+}
+static void DrawSSAO() {
+    LoadConfig();
+    if (!g_cfg.ao || !g.ctx || !g.dev || !g.depthSRV || !g.rtv) return;
+    if (!BuildBlit(g.dev) || !BuildAO(g.dev)) return;
+    ID3D11PixelShader* ps = g.msaaSamples > 1 ? g_aoPS_MS : g_aoPS_1x;
+    if (!ps) return;
+    D3D11_MAPPED_SUBRESOURCE m{};
+    if (SUCCEEDED(g.ctx->Map(g_aoCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+        float data[8] = { 1.0f / g.bbW, 1.0f / g.bbH, g_aoProj33, g_aoProj43, g_cfg.aoRadius, g_cfg.aoStrength, 0, 0 };
+        memcpy(m.pData, data, sizeof(data)); g.ctx->Unmap(g_aoCB, 0);
+    }
+    ID3D11Buffer* sizeCB = nullptr;
+    D3D11_BUFFER_DESC cbd{}; cbd.ByteWidth = 16; cbd.Usage = D3D11_USAGE_DYNAMIC;
+    cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER; cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    static ID3D11Buffer* sizeCBcache = nullptr;
+    if (!sizeCBcache) g.dev->CreateBuffer(&cbd, nullptr, &sizeCBcache);
+    sizeCB = sizeCBcache;
+    if (sizeCB && SUCCEEDED(g.ctx->Map(sizeCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+        float sz[4] = { (float)g.bbW, (float)g.bbH, 0, 0 };
+        memcpy(m.pData, sz, sizeof(sz)); g.ctx->Unmap(sizeCB, 0);
+    }
+    ID3D11RenderTargetView* rtv = g.rtv;
+    g.ctx->OMSetRenderTargets(1, &rtv, nullptr);
+    D3D11_VIEWPORT vp{}; vp.Width = (float)g.bbW; vp.Height = (float)g.bbH; vp.MaxDepth = 1.f;
+    g.ctx->RSSetViewports(1, &vp);
+    g.ctx->IASetInputLayout(nullptr);
+    g.ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    g.ctx->VSSetShader(g_blitVS, nullptr, 0);
+    g.ctx->PSSetShader(ps, nullptr, 0);
+    ID3D11Buffer* cbs[2] = { g_aoCB, sizeCB };
+    g.ctx->PSSetConstantBuffers(0, 2, cbs);
+    g.ctx->PSSetShaderResources(0, 1, &g.depthSRV);
+    g.ctx->OMSetDepthStencilState(g.dsOff, 0);
+    float bf[4] = { 0,0,0,0 };
+    g.ctx->OMSetBlendState(g_aoBlend, bf, 0xffffffff);
+    g.ctx->Draw(3, 0);
+    g.ctx->OMSetBlendState(nullptr, bf, 0xffffffff);
+    ID3D11ShaderResourceView* nul = nullptr; g.ctx->PSSetShaderResources(0, 1, &nul);
+}
 
 static ID3D11RasterizerState* GetRasterizer(float bias, float slope, DWORD cull, DWORD fill) {
     for (int i = 0; i < g_rsCount; ++i)
@@ -377,14 +559,11 @@ static void CreateMSAATargets(UINT w, UINT h) {
     if (g.msaaTex) { g.msaaTex->Release(); g.msaaTex = nullptr; }
     if (!g.dev || !w || !h) { g.msaaSamples = 1; return; }
 
-    // NE_MSAA=0/1/2/4/8 overrides the auto-picked sample count, to A/B the FPS cost
-    // of MSAA itself against the wrapper's own per-draw overhead without recompiling.
-    static int override_ = -1;
-    if (override_ < 0) {
-        char b[8] = "";
-        override_ = GetEnvironmentVariableA("NE_MSAA", b, sizeof(b)) ? atoi(b) : -1;
-    }
-    if (override_ == 0 || override_ == 1) { g.msaaSamples = 1; Log("[ne] MSAA forced off (NE_MSAA=%d)\n", override_); return; }
+    // "msaa" in nativeengine_config.json overrides the auto-picked sample count:
+    // -1/absent = auto (highest supported), 0/1 = off, 2/4/8 = forced.
+    LoadConfig();
+    int override_ = g_cfg.msaa;
+    if (override_ == 0 || override_ == 1) { g.msaaSamples = 1; Log("[ne] MSAA forced off (config)\n"); return; }
 
     UINT samples = 1, quality = 0;
     UINT candidates3[3] = { 8u, 4u, 2u };
@@ -410,6 +589,30 @@ static void CreateMSAATargets(UINT w, UINT h) {
     } else {
         g.msaaSamples = 1;
     }
+}
+
+// The scene depth used to be D3D11_BIND_DEPTH_STENCIL only; SSAO needs to read it back
+// as a texture, which a depth format cannot bind as both at once -- has to be a
+// TYPELESS resource with two views: a DSV interpreting it as a real depth format for
+// the normal draw path, and an SRV interpreting the same bits as a plain color format
+// for reading. Depends on g.msaaSamples, so call this AFTER CreateMSAATargets().
+static void CreateSceneDepth(UINT w, UINT h) {
+    if (g.dsv) { g.dsv->Release(); g.dsv = nullptr; }
+    if (g.depthSRV) { g.depthSRV->Release(); g.depthSRV = nullptr; }
+    if (g.depthTex) { g.depthTex->Release(); g.depthTex = nullptr; }
+    D3D11_TEXTURE2D_DESC dd{}; dd.Width = w; dd.Height = h; dd.MipLevels = 1; dd.ArraySize = 1;
+    dd.Format = DXGI_FORMAT_R24G8_TYPELESS; dd.SampleDesc.Count = g.msaaSamples; dd.Usage = D3D11_USAGE_DEFAULT;
+    dd.BindFlags = D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE;
+    HRESULT hrTex = FAILED(g.dev->CreateTexture2D(&dd, nullptr, &g.depthTex)) ? E_FAIL : S_OK;
+    if (FAILED(hrTex) || !g.depthTex) { Log("[ne] scene depth tex FAILED\n"); return; }
+    D3D11_DEPTH_STENCIL_VIEW_DESC dvd{}; dvd.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    dvd.ViewDimension = g.msaaSamples > 1 ? D3D11_DSV_DIMENSION_TEXTURE2DMS : D3D11_DSV_DIMENSION_TEXTURE2D;
+    HRESULT hrDsv = g.dev->CreateDepthStencilView(g.depthTex, &dvd, &g.dsv);
+    D3D11_SHADER_RESOURCE_VIEW_DESC svd{}; svd.Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+    if (g.msaaSamples > 1) { svd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DMS; }
+    else { svd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D; svd.Texture2D.MipLevels = 1; }
+    HRESULT hrSrv = g.dev->CreateShaderResourceView(g.depthTex, &svd, &g.depthSRV);
+    Log("[ne] scene depth: dsv=0x%08X srv=0x%08X samples=%u\n", hrDsv, hrSrv, g.msaaSamples);
 }
 
 static void CreateOutlineTarget(UINT w, UINT h) {
@@ -1495,8 +1698,8 @@ struct NDevice : Unk<IDirect3DDevice9> {
     void SetSync(D3DPRESENT_PARAMETERS* pp) {
         if (!pp) return;
         syncInterval = (pp->PresentationInterval == D3DPRESENT_INTERVAL_IMMEDIATE) ? 0u : 1u;
-        char e[8] = {};
-        if (GetEnvironmentVariableA("NE_NOVSYNC", e, sizeof(e)) && e[0] == '1') syncInterval = 0;
+        LoadConfig();
+        if (!g_cfg.vsync) syncInterval = 0;
         Log("[ne] PresentationInterval=0x%X -> SyncInterval=%u\n", pp->PresentationInterval, syncInterval);
     }
     NDevice(IDirect3D9* p, HWND h, D3DPRESENT_PARAMETERS* pp) : parent(p), hwnd(h) {
@@ -1557,9 +1760,7 @@ struct NDevice : Unk<IDirect3DDevice9> {
         if (SUCCEEDED(hr) && g.sc) {
             if (SUCCEEDED(g.sc->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&g.bbTex)) && g.bbTex) g.dev->CreateRenderTargetView(g.bbTex, nullptr, &g.rtv);
             CreateMSAATargets(g.bbW, g.bbH);
-            D3D11_TEXTURE2D_DESC dd{}; dd.Width = g.bbW; dd.Height = g.bbH; dd.MipLevels = 1; dd.ArraySize = 1;
-            dd.Format = DXGI_FORMAT_D24_UNORM_S8_UINT; dd.SampleDesc.Count = g.msaaSamples; dd.Usage = D3D11_USAGE_DEFAULT; dd.BindFlags = D3D11_BIND_DEPTH_STENCIL;
-            if (SUCCEEDED(g.dev->CreateTexture2D(&dd, nullptr, &g.depthTex)) && g.depthTex) g.dev->CreateDepthStencilView(g.depthTex, nullptr, &g.dsv);
+            CreateSceneDepth(g.bbW, g.bbH);
             g.curRTV = g.msaaSamples > 1 ? g.msaaRTV : g.rtv; g.curDSV = g.dsv;
             CreateOutlineTarget(g.bbW, g.bbH);
             BuildDefaultPipeline();
@@ -1778,6 +1979,8 @@ struct NDevice : Unk<IDirect3DDevice9> {
     STDMETHOD(Present)(const RECT*, const RECT*, HWND, const RGNDATA*) {
         CtxLock lk;
         {
+            static bool initDone = false;
+            if (!initDone) { LoadConfig(); g_outlineEnabled = g_cfg.outlineDefault; initDone = true; }
             static bool prevF3 = false;
             bool nowF3 = (GetAsyncKeyState(VK_F3) & 0x8000) != 0;
             if (nowF3 && !prevF3) { g_outlineEnabled = !g_outlineEnabled; Log("[outline] %s\n", g_outlineEnabled ? "ON" : "OFF"); }
@@ -1789,6 +1992,8 @@ struct NDevice : Unk<IDirect3DDevice9> {
         // CompositeOutline() does exactly that.
         if (g.ctx && g.msaaSamples > 1 && g.msaaTex && g.bbTex)
             g.ctx->ResolveSubresource(g.bbTex, 0, g.msaaTex, 0, DXGI_FORMAT_B8G8R8A8_UNORM);
+        g_aoProj33 = mProj._33; g_aoProj43 = mProj._43;
+        DrawSSAO();
         CompositeOutline();
         static LONG f = 0; LONG ff = InterlockedIncrement(&f);
         { LONGLONG now = QPC(); if (t_lastPresent) t_frameTotal += now - t_lastPresent; t_lastPresent = now; }
@@ -1883,14 +2088,13 @@ struct NDevice : Unk<IDirect3DDevice9> {
         if (g.msaaRTV) { g.msaaRTV->Release(); g.msaaRTV = nullptr; }
         if (g.msaaTex) { g.msaaTex->Release(); g.msaaTex = nullptr; }
         if (g.dsv) { g.dsv->Release(); g.dsv = nullptr; }
+        if (g.depthSRV) { g.depthSRV->Release(); g.depthSRV = nullptr; }
         if (g.depthTex) { g.depthTex->Release(); g.depthTex = nullptr; }
         g.sc->ResizeBuffers(1, nw, nh, DXGI_FORMAT_B8G8R8A8_UNORM, 0);
         g.bbW = nw; g.bbH = nh;
         if (SUCCEEDED(g.sc->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&g.bbTex)) && g.bbTex) g.dev->CreateRenderTargetView(g.bbTex, nullptr, &g.rtv);
         CreateMSAATargets(nw, nh);
-        D3D11_TEXTURE2D_DESC dd{}; dd.Width = nw; dd.Height = nh; dd.MipLevels = 1; dd.ArraySize = 1;
-        dd.Format = DXGI_FORMAT_D24_UNORM_S8_UINT; dd.SampleDesc.Count = g.msaaSamples; dd.Usage = D3D11_USAGE_DEFAULT; dd.BindFlags = D3D11_BIND_DEPTH_STENCIL;
-        if (SUCCEEDED(g.dev->CreateTexture2D(&dd, nullptr, &g.depthTex)) && g.depthTex) g.dev->CreateDepthStencilView(g.depthTex, nullptr, &g.dsv);
+        CreateSceneDepth(nw, nh);
         g.curRTV = g.msaaSamples > 1 ? g.msaaRTV : g.rtv; g.curDSV = g.dsv;
         CreateOutlineTarget(nw, nh);
         curVP.X = 0; curVP.Y = 0; curVP.Width = nw; curVP.Height = nh; curVP.MinZ = 0.f; curVP.MaxZ = 1.f;
@@ -2285,15 +2489,14 @@ struct NDevice : Unk<IDirect3DDevice9> {
         // stale enable flag into the wrong draw. BeginProgDraw runs right before every
         // individual draw, so this always reflects the current object's real state.
         {
-            static int noFog = -1;
-            if (noFog < 0) { char e[8] = ""; noFog = (GetEnvironmentVariableA("NE_NO_FOG", e, sizeof(e)) && e[0] == '1') ? 1 : 0; }
+            LoadConfig();
             static ID3D11Buffer* fogCB = nullptr;
-            if (!noFog && !fogCB) {
+            if (g_cfg.fog && !fogCB) {
                 D3D11_BUFFER_DESC d{}; d.ByteWidth = 32; d.Usage = D3D11_USAGE_DYNAMIC;
                 d.BindFlags = D3D11_BIND_CONSTANT_BUFFER; d.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
                 g.dev->CreateBuffer(&d, nullptr, &fogCB);
             }
-            if (!noFog && fogCB) {
+            if (g_cfg.fog && fogCB) {
                 float data[8]; NE_FogState(&data[0], &data[4]);
                 D3D11_MAPPED_SUBRESOURCE m{};
                 if (SUCCEEDED(g.ctx->Map(fogCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {

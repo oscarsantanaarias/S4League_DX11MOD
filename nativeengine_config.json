@@ -1,0 +1,9 @@
+{
+  "msaa": -1,
+  "fog": true,
+  "ao": true,
+  "ao_radius": 3.0,
+  "ao_strength": 1.0,
+  "vsync": true,
+  "outline_default": false
+}
